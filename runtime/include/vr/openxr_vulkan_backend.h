@@ -68,7 +68,7 @@ enum class OpenXRVulkanCapability {
     VulkanHeadersUnavailable,
     DawnNativeHandlesUnavailable,
     InvalidNativeContext,
-    MissingEnable2Extension,
+    MissingEnableExtension,
     RuntimeRejectedGraphicsDevice,
     RuntimeApiVersionMismatch,
 };
@@ -124,7 +124,7 @@ public:
     // shim is compiled in.
     static OpenXRVulkanCapabilityInfo DawnInteropCapability();
 
-    // runtime must already be initialized with XR_KHR_vulkan_enable2 in its
+    // runtime must already be initialized with XR_KHR_vulkan_enable in its
     // required extension list and must not yet own a session.
     bool Initialize(OpenXRRuntime& runtime,
                     const OpenXRVulkanNativeContext& native_context,
@@ -139,6 +139,15 @@ public:
     // should_render is false or views are invalid, the frame is ended without a
     // layer as required by the OpenXR frame protocol.
     bool SubmitProjection(const OpenXRFrame& frame);
+
+    // Ends the begun display frame while presenting a completed asynchronous
+    // frame. present supplies the pose/FOV that rendered the released swapchain
+    // image; only its view data is used, and the frame token being ended is
+    // display. The asynchronous compositor holds swapchain images for an
+    // in-flight Aurora job while it ends the display frame; OpenXR presents the
+    // most recently released image of each referenced swapchain, so an acquired
+    // but unreleased image is not an error here.
+    bool SubmitProjection(const OpenXRFrame& display, const OpenXRFrame& present);
 
     bool IsInitialized() const { return m_runtime != nullptr; }
     int64_t SwapchainFormat() const { return m_swapchain_format; }

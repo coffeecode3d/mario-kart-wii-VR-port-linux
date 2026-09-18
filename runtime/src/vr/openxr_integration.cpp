@@ -33,11 +33,12 @@
 
 #if defined(MKW_ENABLE_OPENXR)
 #include "vr/openxr_runtime.h"
+#include "vr/openxr_hand_mesh.h"
 #if defined(_WIN32)
 #include "vr/openxr_d3d12.h"
-#include "vr/openxr_hand_mesh.h"
 #else
 #include "vr/openxr_vulkan_backend.h"
+#include <aurora/vulkan_interop.h>
 #endif
 #endif
 
@@ -45,6 +46,10 @@ namespace mkw::vr {
 namespace {
 std::mutex diagnosticsMutex;
 OpenXRDiagnostics diagnostics;
+
+// Bounded retries (one per async pacing pass) before an unresolved Vulkan
+// stereo sink gives up: a single slow Aurora worker must not end the session.
+inline constexpr uint32_t kMaxAsyncStallRounds = 20;
 
 void ConfigurePolicy(bool enabled) noexcept {
     SetQuestButtonMapping({RuntimeConfigFile::Get().vrSwapItemTrick,RuntimeConfigFile::Get().vrSwapCockpitDriftBrake});
@@ -61,7 +66,7 @@ void ConfigurePolicy(bool enabled) noexcept {
     MkwVRFirstPersonApplyConfiguredSettings();
 }
 
-#if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
+#if defined(MKW_ENABLE_OPENXR)
 
 struct Quaternion {
     float x = 0.0f;
@@ -218,6 +223,265 @@ void ViewFromBase(const XrPosef& eye_pose, const Pose& base, bool position_valid
     output[10] = rotation[8];
     output[11] = translation[2] * units_per_meter;
 }
+
+// Eye viewport layout for the current OpenXR frame, backend-agnostic.
+struct OpenXRStereoEyeLayout {
+    std::array<uint32_t, kOpenXREyeCount> width{};
+    std::array<uint32_t, kOpenXREyeCount> height{};
+};
+
+// Presentation context for the current OpenXR frame, backend-agnostic.
+struct OpenXRStereoPresentation {
+    bool immersive = false;
+    bool anchored = false;
+    float distance_meters = 0.0f;
+    float width_meters = 0.0f;
+};
+
+// Driving, cockpit, hand-HUD, and quest-input state shared by the D3D12
+// (Windows) and Vulkan (Linux) OpenXR integrations so the experience logic
+// stays identical across graphics backends. All rendering-agnostic; only pose
+// data and the OpenXRRuntime session are consumed.
+class DrivingFrameState {
+public:
+    void Reset() noexcept {
+        wheel_ = {};
+        wheel_reference_ = {};
+        last_held_ = {};
+        last_wheel_time_ = 0;
+        base_pose_ = {};
+        base_pose_valid_ = false;
+        base_position_valid_ = false;
+        last_immersive_ = false;
+    }
+
+    void Update(const OpenXRFrame& frame, bool immersive, float units_per_meter,
+                OpenXRRuntime& runtime) noexcept {
+        if (runtime.ConsumeAppSpaceChangesThrough(frame.predicted_display_time)) {
+            Reset();
+        }
+        auto& destination = driving_frame_;
+        destination = {};
+        if (!immersive) {
+            last_immersive_ = false;
+            wheel_.Update({}, false, 0);
+            runtime.PublishDrivingInput(false, 0, false, 0);
+            return;
+        }
+
+        const bool position_valid =
+            (frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+        if (!base_pose_valid_ || !last_immersive_) {
+            base_pose_ = CenterPose(frame, position_valid);
+            // Recentring establishes heading, never headset pitch or roll.
+            // Otherwise looking down at the tutorial tilts the whole track.
+            const auto forward = Rotate(base_pose_.orientation, {0.0f, 0.0f, -1.0f});
+            const float yaw = std::atan2(-forward[0], -forward[2]);
+            base_pose_.orientation = {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+            base_pose_valid_ = true;
+            base_position_valid_ = position_valid;
+        } else if (position_valid && !base_position_valid_) {
+            base_pose_.position = CenterPose(frame, true).position;
+            base_position_valid_ = true;
+        }
+        last_immersive_ = true;
+        if (!hand_meshes_loaded_) {
+            hand_meshes_loaded_ = true;
+            const bool loaded = LoadRuntimeHandMeshes(runtime);
+            RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] cockpit hands: "
+                << (loaded ? "Meta runtime mesh" : "controller glove fallback (Meta mesh unavailable)")
+                << std::endl;
+        }
+        auto& cockpit = destination.cockpit;
+        const auto camera = MkwVRFirstPersonGetSnapshot();
+        driving_camera_mode_ = camera.mode;
+        const auto& driverAnchor = camera.anchor;
+        if (camera.mode != CameraMode::Game && driverAnchor.valid && driverAnchor.units_per_meter > 0)
+            units_per_meter = driverAnchor.units_per_meter;
+        cockpit.unitsPerMeter = units_per_meter;
+        cockpit.active = position_valid && base_position_valid_ && runtime.IsSessionFocused() &&
+            camera.mode == CameraMode::FirstPerson && driverAnchor.valid;
+        cockpit.nativeWheel = cockpit.active && RuntimeConfigFile::VrNativeSteeringWheel() &&
+            driverAnchor.native_wheel.valid && driverAnchor.native_mesh_prepared;
+        cockpit.bike = driverAnchor.bike;
+        WheelGeometry drivingGeometry = driverAnchor.native_wheel;
+        const auto time = frame.predicted_display_time;
+        const float dt = last_wheel_time_ > 0 ? float(time - last_wheel_time_) * 1.0e-9f : 1.0f / 90.0f;
+        last_wheel_time_ = time;
+        cockpit.nativeWheel = wheel_reference_.Resolve(drivingGeometry,
+            cockpit.active && RuntimeConfigFile::VrNativeSteeringWheel(), cockpit.nativeWheel,
+            last_held_[0] || last_held_[1], cockpit.bike, driverAnchor.vehicle_identity, dt);
+        if (cockpit.bike && !drivingGeometry.valid) {
+            drivingGeometry.center = {0, SteeringWheel::Height, SteeringWheel::Depth};
+            drivingGeometry.right = {1, 0, 0};
+            drivingGeometry.up = {0, 0, -1};
+            drivingGeometry.normal = {0, 1, 0};
+            drivingGeometry.radius = 0.25f;
+            drivingGeometry.valid = true;
+        }
+        if (cockpit.bike) {
+            cockpit.handlebarRadius = drivingGeometry.radius;
+            for (int row = 0; row < 3; ++row) {
+                cockpit.seatFromHandlebar[row * 4] = drivingGeometry.right[row];
+                cockpit.seatFromHandlebar[row * 4 + 1] = drivingGeometry.up[row];
+                cockpit.seatFromHandlebar[row * 4 + 2] = drivingGeometry.normal[row];
+                cockpit.seatFromHandlebar[row * 4 + 3] = drivingGeometry.center[row];
+            }
+        }
+        if (cockpit.nativeWheel != last_native_wheel_ || cockpit.bike != last_bike_) {
+            wheel_ = {};
+            last_native_wheel_ = cockpit.nativeWheel;
+            last_bike_ = cockpit.bike;
+        }
+        std::array<WheelHand, 2> hands{};
+        for (size_t hand = 0; hand < 2; ++hand) {
+            auto& target = cockpit.hands[hand];
+            target.tracked = hand ? runtime.RightGripValid() : runtime.LeftGripValid();
+            const auto& grip = hand ? runtime.RightGripPose() : runtime.LeftGripPose();
+            target.squeeze = runtime.HandSqueeze(hand);
+            const auto position = Rotate(Conjugate(base_pose_.orientation), {
+                grip.position.x - base_pose_.position[0], grip.position.y - base_pose_.position[1],
+                grip.position.z - base_pose_.position[2]});
+            const auto rotation = Multiply(Conjugate(base_pose_.orientation),
+                {grip.orientation.x, grip.orientation.y, grip.orientation.z, grip.orientation.w});
+            float matrix[9];
+            RotationMatrix(rotation, matrix);
+            for (int row = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) target.seatFromGrip[row * 4 + col] = matrix[row * 3 + col];
+                target.seatFromGrip[row * 4 + 3] = position[row];
+            }
+            hands[hand] = {position[0], position[1], position[2], target.squeeze, target.tracked};
+        }
+        if (cockpit.nativeWheel || cockpit.bike)
+            for (auto& hand : hands) hand = drivingGeometry.ToWheel(hand);
+        const auto wheel = wheel_.Update(hands, cockpit.active, dt,
+            cockpit.nativeWheel || cockpit.bike ? drivingGeometry.radius : SteeringWheel::Radius,
+            cockpit.bike, RuntimeConfigFile::VrWheelTuning());
+        cockpit.wheelAngle = wheel.visualAngle;
+        for (size_t hand = 0; hand < 2; ++hand)
+            if (wheel.held[hand] != last_held_[hand] && cockpit.active && RuntimeConfigFile::VrWheelTuning().haptics)
+                runtime.PulseGrip(hand, wheel.held[hand]);
+        last_held_ = wheel.held;
+        for (int hand = 0; hand < 2; ++hand) cockpit.hands[hand].held = wheel.held[hand];
+        runtime.PublishDrivingInput(cockpit.active, wheel.steering,
+                                    wheel.held[0] || wheel.held[1], cockpit.wheelAngle);
+    }
+
+    void Build(AuroraStereoFrame& destination, const OpenXRFrame& frame,
+               const OpenXRStereoEyeLayout& eyes,
+               const OpenXRStereoPresentation& presentation, float render_scale,
+               uint64_t content_tag, float units_per_meter, OpenXRRuntime& runtime) noexcept {
+        if (last_wheel_time_ != frame.predicted_display_time || !presentation.immersive)
+            Update(frame, presentation.immersive, units_per_meter, runtime);
+        destination = driving_frame_;
+        destination.frameToken = frame.serial;
+        destination.contentTag = content_tag;
+        destination.renderScale = render_scale;
+        destination.mode = presentation.immersive ? AURORA_STEREO_FRAME_IMMERSIVE_REPLAY
+                                                  : AURORA_STEREO_FRAME_VIRTUAL_SCREEN;
+        for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+            destination.eyes[eye].width = eyes.width[eye];
+            destination.eyes[eye].height = eyes.height[eye];
+            IdentityEye(destination.eyes[eye]);
+        }
+        if (!presentation.immersive) {
+            destination.ui.anchored = presentation.anchored;
+            if (destination.ui.anchored) {
+                const auto anchor = runtime.PanelOrigin();
+                const Pose panel{
+                    {anchor.orientation.x, anchor.orientation.y, anchor.orientation.z,
+                     anchor.orientation.w},
+                    {anchor.position.x, anchor.position.y, anchor.position.z}};
+                destination.ui.distance = presentation.distance_meters;
+                destination.ui.width = presentation.width_meters;
+                const auto input = ReadQuestInputSnapshot();
+                for (int hand = 0; hand < 2; ++hand) {
+                    const auto& p = input.ui_hands[hand];
+                    destination.ui.tracked[hand] = p.valid;
+                    const auto& aim = hand ? input.ui_pointer : input.ui_left_pointer;
+                    destination.ui.pointerTracked[hand] = aim.valid && input.active;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        destination.ui.pointerRay[hand][axis] = aim.position[axis];
+                        destination.ui.pointerRay[hand][axis + 3] = aim.forward[axis];
+                    }
+                    auto* m = destination.ui.panelFromGrip[hand];
+                    for (int row = 0; row < 3; ++row) {
+                        m[row * 4] = p.right[row];
+                        m[row * 4 + 1] = p.up[row];
+                        m[row * 4 + 2] = -p.forward[row];
+                        m[row * 4 + 3] = p.position[row];
+                    }
+                }
+                for (int eye = 0; eye < 2; ++eye) {
+                    ViewFromBase(frame.views[eye].pose, panel, true, 1,
+                                 destination.ui.eyeFromPanel[eye]);
+                    ProjectionFromFov(frame.views[eye].fov, destination.eyes[eye].projection);
+                }
+            }
+            return;
+        }
+        units_per_meter = destination.cockpit.unitsPerMeter;
+        const bool position_valid =
+            (frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+        auto& cockpit = destination.cockpit;
+        Pose hand_panel{};
+        // In the cockpit, use the existing fixed forward HUD plane (including
+        // items). It follows the seated frame, not head turns or controller loss.
+        destination.handHud = driving_camera_mode_ != CameraMode::FirstPerson &&
+            position_valid && runtime.LeftGripValid();
+        if (destination.handHud) {
+            const auto& grip = runtime.LeftGripPose();
+            const auto offset = Rotate({grip.orientation.x, grip.orientation.y,
+                                        grip.orientation.z, grip.orientation.w},
+                                       {0.0f, 0.06f, -0.035f});
+            hand_panel.position = {grip.position.x + offset[0], grip.position.y + offset[1],
+                                   grip.position.z + offset[2]};
+            // Billboard toward the cyclopean eye, upright in tracking space.
+            const auto head = CenterPose(frame, true);
+            const float dx = head.position[0] - hand_panel.position[0];
+            const float dy = head.position[1] - hand_panel.position[1];
+            const float dz = head.position[2] - hand_panel.position[2];
+            const float yaw = std::atan2(dx, dz);
+            const float pitch = -std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+            hand_panel.orientation = Multiply(
+                {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)},
+                {std::sin(pitch * 0.5f), 0.0f, 0.0f, std::cos(pitch * 0.5f)});
+            // HudScreen lifts NDC onto z=-1. Offset the panel origin so that
+            // this plane, rather than its origin, sits above the controller.
+            const auto normal = Rotate(hand_panel.orientation, {0.0f, 0.0f, 1.0f});
+            for (int axis = 0; axis < 3; ++axis) hand_panel.position[axis] += normal[axis];
+        }
+        for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+            ViewFromBase(frame.views[eye].pose, base_pose_, position_valid, 1.0f,
+                         cockpit.eyeFromSeat[eye]);
+            if (destination.handHud) {
+                ViewFromBase(frame.views[eye].pose, hand_panel, true, 1.0f,
+                             destination.handHudViewFromPanel[eye]);
+            }
+            ProjectionFromFov(frame.views[eye].fov, destination.eyes[eye].projection);
+            ViewFromBase(frame.views[eye].pose, base_pose_,
+                         position_valid && base_position_valid_,
+                         units_per_meter, destination.eyes[eye].viewFromCenter);
+        }
+    }
+
+private:
+    AuroraStereoFrame driving_frame_{};
+    Pose base_pose_{};
+    SteeringWheel wheel_;
+    WheelReferenceLatch wheel_reference_;
+    std::array<bool, 2> last_held_{};
+    XrTime last_wheel_time_ = 0;
+    CameraMode driving_camera_mode_ = CameraMode::Game;
+    bool last_native_wheel_ = false;
+    bool last_bike_ = false;
+    bool hand_meshes_loaded_ = false;
+    bool base_pose_valid_ = false;
+    bool base_position_valid_ = false;
+    bool last_immersive_ = false;
+};
+
+#if defined(_WIN32)
 
 class OpenXRIntegration final {
 public:
@@ -534,7 +798,7 @@ private:
             runtime_->PollControllers(display.xr_frame.predicted_display_time);
             display.presentation.anchored=runtime_->PanelAnchored();
             if (runtime_->ConsumeCameraClick() && immersive) MkwVRCycleCamera();
-            UpdateDrivingFrame(display, immersive, policy.EffectiveUnitsPerMeter());
+            driving_.Update(display.xr_frame, immersive, policy.EffectiveUnitsPerMeter(), *runtime_);
             if (!delivery.PendingToken() && display.xr_frame.should_render && display.xr_frame.views_valid) {
                 if (!backend_->BeginSubmission(display)) {
                     SetError(backend_->LastError());
@@ -544,9 +808,26 @@ private:
                 pending = display;
                 pending_start = Clock::now();
                 delivery.Start(pending.xr_frame.serial, policy.content_tag, session);
-                std::lock_guard lock(published_mutex_);
-                BuildPublishedFrame(pending, immersive, policy.EffectiveUnitsPerMeter(), policy.content_tag);
-                published_.store(&published_frame_, std::memory_order_release);
+                {
+                    std::lock_guard lock(published_mutex_);
+                    const OpenXRStereoEyeLayout eye_layout{
+                        .width = {pending.render_width[0], pending.render_width[1]},
+                        .height = {pending.render_height[0], pending.render_height[1]},
+                    };
+                    const OpenXRStereoPresentation presentation{
+                        .immersive = immersive,
+                        .anchored = pending.presentation.anchored,
+                        .distance_meters = pending.presentation.quad_distance_meters,
+                        .width_meters = pending.presentation.quad_width_meters,
+                    };
+                    driving_.Build(published_frame_.frame, pending.xr_frame, eye_layout,
+                                   presentation,
+                                   RuntimeConfigFile::Get().vrAdaptiveResolution
+                                       ? adaptive_resolution_.Scale()
+                                       : 1.0f,
+                                   policy.content_tag, policy.EffectiveUnitsPerMeter(), *runtime_);
+                    published_.store(&published_frame_, std::memory_order_release);
+                }
             }
             const bool show = delivery.CanDisplay(policy.content_tag, session) &&
                               display.xr_frame.should_render && display.xr_frame.views_valid;
@@ -708,8 +989,22 @@ private:
                 // configured diorama scale. Head translation and IPD are the
                 // only things this multiplies, so a one-frame disagreement with
                 // the camera's own switch is not observable.
-                BuildPublishedFrame(frame, immersive, policy.EffectiveUnitsPerMeter(),
-                                    policy.content_tag);
+                const OpenXRStereoEyeLayout eye_layout{
+                    .width = {frame.render_width[0], frame.render_width[1]},
+                    .height = {frame.render_height[0], frame.render_height[1]},
+                };
+                const OpenXRStereoPresentation presentation{
+                    .immersive = immersive,
+                    .anchored = frame.presentation.anchored,
+                    .distance_meters = frame.presentation.quad_distance_meters,
+                    .width_meters = frame.presentation.quad_width_meters,
+                };
+                driving_.Build(published_frame_.frame, frame.xr_frame, eye_layout,
+                               presentation,
+                               RuntimeConfigFile::Get().vrAdaptiveResolution
+                                   ? adaptive_resolution_.Scale()
+                                   : 1.0f,
+                               policy.content_tag, policy.EffectiveUnitsPerMeter(), *runtime_);
                 published_.store(&published_frame_, std::memory_order_release);
             }
 
@@ -796,214 +1091,14 @@ private:
         ShutdownOrRetainGraphicsObjects();
     }
 
-    void UpdateDrivingFrame(const OpenXRD3D12Frame& source, bool immersive,
-                            float units_per_meter) noexcept {
-        ApplyPendingReferenceSpaceChange(source.xr_frame);
-        auto& destination = driving_frame_;
-        destination = {};
-        if (!immersive) {
-            last_immersive_ = false;
-            wheel_.Update({}, false, 0);
-            runtime_->PublishDrivingInput(false, 0, false, 0);
-            return;
-        }
-
-        const bool position_valid =
-            (source.xr_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-        if (!base_pose_valid_ || !last_immersive_) {
-            base_pose_ = CenterPose(source.xr_frame, position_valid);
-            // Recentring establishes heading, never headset pitch or roll.
-            // Otherwise looking down at the tutorial tilts the whole track.
-            const auto forward=Rotate(base_pose_.orientation,{0.0f,0.0f,-1.0f});
-            const float yaw=std::atan2(-forward[0],-forward[2]);
-            base_pose_.orientation={0.0f,std::sin(yaw*0.5f),0.0f,std::cos(yaw*0.5f)};
-            base_pose_valid_ = true;
-            base_position_valid_ = position_valid;
-        } else if (position_valid && !base_position_valid_) {
-            base_pose_.position = CenterPose(source.xr_frame, true).position;
-            base_position_valid_ = true;
-        }
-        last_immersive_ = true;
-        if (!hand_meshes_loaded_) {
-            hand_meshes_loaded_ = true;
-            const bool loaded = LoadRuntimeHandMeshes(*runtime_);
-            RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] cockpit hands: "
-                << (loaded ? "Meta runtime mesh" : "controller glove fallback (Meta mesh unavailable)") << std::endl;
-        }
-        auto& cockpit = destination.cockpit;
-        const auto camera = MkwVRFirstPersonGetSnapshot();
-        driving_camera_mode_=camera.mode;
-        const auto& driverAnchor = camera.anchor;
-        if(camera.mode!=CameraMode::Game && driverAnchor.valid && driverAnchor.units_per_meter>0)
-            units_per_meter=driverAnchor.units_per_meter;
-        cockpit.unitsPerMeter=units_per_meter;
-        cockpit.active = position_valid && base_position_valid_ && runtime_->IsSessionFocused() &&
-            camera.mode == CameraMode::FirstPerson && driverAnchor.valid;
-        cockpit.nativeWheel = cockpit.active && RuntimeConfigFile::VrNativeSteeringWheel() &&
-            driverAnchor.native_wheel.valid && driverAnchor.native_mesh_prepared;
-        cockpit.bike=driverAnchor.bike;
-        WheelGeometry drivingGeometry=driverAnchor.native_wheel;
-        const auto time = source.xr_frame.predicted_display_time;
-        const float dt = last_wheel_time_ > 0 ? float(time - last_wheel_time_) * 1.0e-9f : 1.0f / 90.0f;
-        last_wheel_time_ = time;
-        cockpit.nativeWheel=wheel_reference_.Resolve(drivingGeometry,
-            cockpit.active && RuntimeConfigFile::VrNativeSteeringWheel(),cockpit.nativeWheel,
-            last_held_[0]||last_held_[1],cockpit.bike,driverAnchor.vehicle_identity,dt);
-        if(cockpit.bike && !drivingGeometry.valid) {
-            drivingGeometry.center={0,SteeringWheel::Height,SteeringWheel::Depth};
-            drivingGeometry.right={1,0,0}; drivingGeometry.up={0,0,-1}; drivingGeometry.normal={0,1,0};
-            drivingGeometry.radius=0.25f; drivingGeometry.valid=true;
-        }
-        if(cockpit.bike) {
-            cockpit.handlebarRadius=drivingGeometry.radius;
-            for(int row=0;row<3;++row) {
-                cockpit.seatFromHandlebar[row*4]=drivingGeometry.right[row];
-                cockpit.seatFromHandlebar[row*4+1]=drivingGeometry.up[row];
-                cockpit.seatFromHandlebar[row*4+2]=drivingGeometry.normal[row];
-                cockpit.seatFromHandlebar[row*4+3]=drivingGeometry.center[row];
-            }
-        }
-        if (cockpit.nativeWheel != last_native_wheel_ || cockpit.bike!=last_bike_) {
-            wheel_ = {};
-            last_native_wheel_ = cockpit.nativeWheel;
-            last_bike_=cockpit.bike;
-        }
-        std::array<WheelHand, 2> hands{};
-        for (size_t hand = 0; hand < 2; ++hand) {
-            auto& target = cockpit.hands[hand];
-            target.tracked = hand ? runtime_->RightGripValid() : runtime_->LeftGripValid();
-            const auto& grip = hand ? runtime_->RightGripPose() : runtime_->LeftGripPose();
-            target.squeeze = runtime_->HandSqueeze(hand);
-            const auto position = Rotate(Conjugate(base_pose_.orientation), {
-                grip.position.x - base_pose_.position[0], grip.position.y - base_pose_.position[1],
-                grip.position.z - base_pose_.position[2]});
-            const auto rotation = Multiply(Conjugate(base_pose_.orientation),
-                {grip.orientation.x, grip.orientation.y, grip.orientation.z, grip.orientation.w});
-            float matrix[9];
-            RotationMatrix(rotation, matrix);
-            for (int row = 0; row < 3; ++row) {
-                for (int col = 0; col < 3; ++col) target.seatFromGrip[row * 4 + col] = matrix[row * 3 + col];
-                target.seatFromGrip[row * 4 + 3] = position[row];
-            }
-            hands[hand] = {position[0], position[1], position[2], target.squeeze, target.tracked};
-        }
-        if (cockpit.nativeWheel || cockpit.bike)
-            for (auto& hand : hands) hand = drivingGeometry.ToWheel(hand);
-        const auto wheel = wheel_.Update(hands, cockpit.active, dt,
-            cockpit.nativeWheel || cockpit.bike ? drivingGeometry.radius : SteeringWheel::Radius,cockpit.bike,
-            RuntimeConfigFile::VrWheelTuning());
-        // A kart rim follows full hand rotation; handlebars retain their
-        // limited visual travel, while the input accumulator keeps overtravel.
-        cockpit.wheelAngle = wheel.visualAngle;
-        for (size_t hand=0;hand<2;++hand)
-            if (wheel.held[hand]!=last_held_[hand] && cockpit.active && RuntimeConfigFile::VrWheelTuning().haptics)
-                runtime_->PulseGrip(hand,wheel.held[hand]);
-        last_held_=wheel.held;
-        for (int hand = 0; hand < 2; ++hand) cockpit.hands[hand].held = wheel.held[hand];
-        runtime_->PublishDrivingInput(cockpit.active, wheel.steering, wheel.held[0] || wheel.held[1],cockpit.wheelAngle);
-    }
-
-    void BuildPublishedFrame(const OpenXRD3D12Frame& source, bool immersive,
-                             float units_per_meter, uint64_t content_tag) noexcept {
-        // The synchronous path also updates once per XR frame. The asynchronous
-        // path has already updated even when the renderer could not accept work.
-        if (last_wheel_time_ != source.xr_frame.predicted_display_time || !immersive)
-            UpdateDrivingFrame(source, immersive, units_per_meter);
-        auto& destination = published_frame_.frame;
-        destination = driving_frame_;
-        destination.frameToken = source.xr_frame.serial;
-        destination.contentTag = content_tag;
-        destination.renderScale=RuntimeConfigFile::Get().vrAdaptiveResolution?adaptive_resolution_.Scale():1.0f;
-        destination.mode = immersive ? AURORA_STEREO_FRAME_IMMERSIVE_REPLAY : AURORA_STEREO_FRAME_VIRTUAL_SCREEN;
-        for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
-            destination.eyes[eye].width = source.render_width[eye];
-            destination.eyes[eye].height = source.render_height[eye];
-            IdentityEye(destination.eyes[eye]);
-        }
-        if (!immersive) {
-            destination.ui.anchored=source.presentation.anchored;
-            if(destination.ui.anchored) {
-                const auto anchor=runtime_->PanelOrigin();
-                const Pose panel{{anchor.orientation.x,anchor.orientation.y,anchor.orientation.z,anchor.orientation.w},
-                    {anchor.position.x,anchor.position.y,anchor.position.z}};
-                destination.ui.distance=source.presentation.quad_distance_meters;
-                destination.ui.width=source.presentation.quad_width_meters;
-                const auto input=ReadQuestInputSnapshot();
-                for(int hand=0;hand<2;++hand) {
-                    const auto& p=input.ui_hands[hand];destination.ui.tracked[hand]=p.valid;
-                    const auto& aim=hand?input.ui_pointer:input.ui_left_pointer;
-                    destination.ui.pointerTracked[hand]=aim.valid && input.active;
-                    for(int axis=0;axis<3;++axis) {
-                        destination.ui.pointerRay[hand][axis]=aim.position[axis];
-                        destination.ui.pointerRay[hand][axis+3]=aim.forward[axis];
-                    }
-                    auto* m=destination.ui.panelFromGrip[hand];
-                    for(int row=0;row<3;++row) { m[row*4]=p.right[row];m[row*4+1]=p.up[row];m[row*4+2]=-p.forward[row];m[row*4+3]=p.position[row]; }
-                }
-                for(int eye=0;eye<2;++eye) {
-                    ViewFromBase(source.xr_frame.views[eye].pose,panel,true,1,destination.ui.eyeFromPanel[eye]);
-                    ProjectionFromFov(source.xr_frame.views[eye].fov,destination.eyes[eye].projection);
-                }
-            }
-            return;
-        }
-        units_per_meter=destination.cockpit.unitsPerMeter;
-        const bool position_valid = (source.xr_frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-        auto& cockpit = destination.cockpit;
-        Pose hand_panel{};
-        // In the cockpit, use the existing fixed forward HUD plane (including
-        // items). It follows the seated frame, not head turns or controller loss.
-        destination.handHud = driving_camera_mode_ != CameraMode::FirstPerson &&
-            position_valid && runtime_->LeftGripValid();
-        if (destination.handHud) {
-            const auto& grip = runtime_->LeftGripPose();
-            const auto offset = Rotate({grip.orientation.x, grip.orientation.y,
-                                        grip.orientation.z, grip.orientation.w}, {0.0f, 0.06f, -0.035f});
-            hand_panel.position = {grip.position.x + offset[0], grip.position.y + offset[1],
-                                   grip.position.z + offset[2]};
-            // Billboard toward the cyclopean eye, upright in tracking space.
-            const auto head = CenterPose(source.xr_frame, true);
-            const float dx = head.position[0] - hand_panel.position[0];
-            const float dy = head.position[1] - hand_panel.position[1];
-            const float dz = head.position[2] - hand_panel.position[2];
-            const float yaw = std::atan2(dx, dz);
-            const float pitch = -std::atan2(dy, std::sqrt(dx * dx + dz * dz));
-            hand_panel.orientation = Multiply({0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)},
-                                             {std::sin(pitch * 0.5f), 0.0f, 0.0f, std::cos(pitch * 0.5f)});
-            // HudScreen lifts NDC onto z=-1. Offset the panel origin so that
-            // this plane, rather than its origin, sits above the controller.
-            const auto normal = Rotate(hand_panel.orientation, {0.0f, 0.0f, 1.0f});
-            for (int axis = 0; axis < 3; ++axis) hand_panel.position[axis] += normal[axis];
-        }
-        for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
-            ViewFromBase(source.xr_frame.views[eye].pose, base_pose_, position_valid, 1.0f,
-                         cockpit.eyeFromSeat[eye]);
-            if (destination.handHud) {
-                ViewFromBase(source.xr_frame.views[eye].pose, hand_panel, true, 1.0f,
-                             destination.handHudViewFromPanel[eye]);
-            }
-            ProjectionFromFov(source.xr_frame.views[eye].fov,
-                              destination.eyes[eye].projection);
-            ViewFromBase(source.xr_frame.views[eye].pose, base_pose_,
-                         position_valid && base_position_valid_,
-                         units_per_meter, destination.eyes[eye].viewFromCenter);
-        }
-    }
-
     void ApplyPendingReferenceSpaceChange(const OpenXRFrame& frame) noexcept {
         if (runtime_->ConsumeAppSpaceChangesThrough(frame.predicted_display_time)) {
-            ResetTrackingOrigin();
+            driving_.Reset();
         }
     }
 
     void ResetTrackingOrigin() noexcept {
-        wheel_ = {};
-        wheel_reference_={};last_held_={};
-        last_wheel_time_ = 0;
-        base_pose_ = {};
-        base_pose_valid_ = false;
-        base_position_valid_ = false;
-        last_immersive_ = false;
+        driving_.Reset();
     }
 
     void WaitForStopOrDelay(std::chrono::milliseconds delay) {
@@ -1034,25 +1129,13 @@ private:
     std::atomic_bool teardown_requested_{false};
     std::atomic<PublishedFrame*> published_{nullptr};
     PublishedFrame published_frame_{};
-    AuroraStereoFrame driving_frame_{};
-    CameraMode driving_camera_mode_=CameraMode::Game;
+    DrivingFrameState driving_;
     std::mutex published_mutex_;
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
     mutable std::mutex error_mutex_;
     std::string last_error_;
-    Pose base_pose_{};
-    SteeringWheel wheel_;
-    WheelReferenceLatch wheel_reference_;
     AdaptiveResolution adaptive_resolution_;
-    std::array<bool,2> last_held_{};
-    XrTime last_wheel_time_ = 0;
-    bool last_native_wheel_ = false;
-    bool last_bike_ = false;
-    bool hand_meshes_loaded_ = false;
-    bool base_pose_valid_ = false;
-    bool base_position_valid_ = false;
-    bool last_immersive_ = false;
     uint64_t applied_session_run_serial_ = 0;
     bool session_was_active_ = false;
     bool requested_ = false;
@@ -1062,6 +1145,1034 @@ private:
 };
 
 #endif // defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
+
+#if defined(MKW_ENABLE_OPENXR) && !defined(_WIN32)
+
+// Byte-layout family for Vulkan texel formats. vkCmdCopyImage requires src and
+// dst images to have identical formats; the stereo bridge therefore only
+// accepts targets whose channel layout matches Aurora's eye output exactly.
+int VulkanCopyFamily(int64_t format) noexcept {
+    switch (static_cast<int32_t>(format)) {
+    case 37 /* VK_FORMAT_R8G8B8A8_UNORM */:
+    case 43 /* VK_FORMAT_R8G8B8A8_SRGB */:
+        return 1;
+    case 44 /* VK_FORMAT_B8G8R8A8_UNORM */:
+    case 50 /* VK_FORMAT_B8G8R8A8_SRGB */:
+        return 2;
+    case 97 /* VK_FORMAT_R16G16B16A16_SFLOAT */:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+class OpenXRVulkanIntegration final {
+public:
+    static OpenXRVulkanIntegration& Get() {
+        static OpenXRVulkanIntegration integration;
+        return integration;
+    }
+
+    OpenXRStartupResult Prepare(AuroraConfig& aurora_config) {
+        Shutdown();
+        {
+            std::lock_guard lock(error_mutex_);
+            last_error_.clear();
+        }
+        if (graphics_retained_) {
+            SetError("OpenXR cannot be restarted after an unfenceable Vulkan submission");
+            return OpenXRStartupResult::Unavailable;
+        }
+        requested_ = RuntimeConfigFile::VrEnabled(false);
+        ConfigurePolicy(requested_);
+        if (!requested_) {
+            return OpenXRStartupResult::Disabled;
+        }
+        if (aurora_config.desiredBackend != BACKEND_AUTO &&
+            aurora_config.desiredBackend != BACKEND_VULKAN) {
+            SetError("OpenXR currently requires the Vulkan graphics backend on Linux");
+            return OpenXRStartupResult::Unavailable;
+        }
+        const OpenXRVulkanCapabilityInfo capability = OpenXRVulkanBackend::DawnInteropCapability();
+        if (!capability) {
+            SetError(capability.reason);
+            return OpenXRStartupResult::Unavailable;
+        }
+
+        logger_ = [](OpenXRLogLevel level, std::string_view message) {
+            const char* name = level == OpenXRLogLevel::Error ? "error" :
+                               level == OpenXRLogLevel::Warning ? "warning" : "info";
+            RT_LOG(RT_TAG_RUNTIME) << "[openxr::" << name << "] " << message << std::endl;
+        };
+        runtime_ = std::make_unique<OpenXRRuntime>(logger_);
+        backend_ = std::make_unique<OpenXRVulkanBackend>(logger_);
+
+        OpenXRConfig config{};
+        config.application_name = aurora_config.appName != nullptr ? aurora_config.appName
+                                                                    : "WiiCompiled";
+        config.engine_name = "Aurora";
+        config.resolution_scale = RuntimeConfigFile::VrRenderScale(1.0f);
+        config.required_extensions = {"XR_KHR_vulkan_enable"};
+        if (!runtime_->Initialize(config)) {
+            SetError("OpenXR instance initialization failed: " + runtime_->LastError().message);
+            ResetPreparedObjects();
+            return OpenXRStartupResult::Unavailable;
+        }
+        aurora_config.desiredBackend = BACKEND_VULKAN;
+        aurora_config.xrInterop = true;
+        prepared_ = true;
+        return OpenXRStartupResult::Prepared;
+    }
+
+    bool Start(AuroraBackend active_backend) {
+        if (!prepared_ || runtime_ == nullptr || backend_ == nullptr) {
+            return !requested_;
+        }
+        if (active_backend != BACKEND_VULKAN) {
+            SetError("Aurora could not create the OpenXR-required Vulkan backend");
+            ResetPreparedObjects();
+            return false;
+        }
+        AuroraVulkanNativeContext native{};
+        if (!aurora_vulkan_get_native_handles(&native)) {
+            SetError("Aurora did not expose Dawn Vulkan native handles");
+            ResetPreparedObjects();
+            return false;
+        }
+        native_context_ = native;
+
+        OpenXRVulkanBackendConfig backend_config{};
+        backend_config.require_transfer_destination = true;
+        backend_config.image_wait_timeout =
+            250'000'000; // 250 ms bounds the swapchain wait so a stalled
+                         // runtime cannot hang the pacing thread forever.
+        backend_config.projection_layer_flags = 0;
+        if (!backend_->Initialize(*runtime_, BuildBackendContext(native), backend_config)) {
+            SetError(backend_->LastError().message);
+            ResetPreparedObjects();
+            return false;
+        }
+
+        // The same-device GPU copy requires Aurora to render into a texel
+        // layout the OpenXR swapchain can accept. Reject a mismatch up front
+        // instead of failing every stereo frame at the bridge.
+        const int64_t swapchain_format = backend_->SwapchainFormat();
+        const int swapchain_family = VulkanCopyFamily(swapchain_format);
+        const int aurora_family = VulkanCopyFamily(static_cast<int64_t>(native.colorFormat));
+        if (swapchain_family == 0 || swapchain_family != aurora_family) {
+            SetError("The OpenXR Vulkan swapchain format is not byte-compatible "
+                     "with Aurora's Vulkan render format");
+            backend_->Shutdown();
+            ResetPreparedObjects();
+            return false;
+        }
+
+        if (!aurora_vulkan_enable_stereo_bridge(&OpenXRVulkanIntegration::StereoSubmitted, this)) {
+            SetError("aurora_vulkan_enable_stereo_bridge failed");
+            backend_->Shutdown();
+            ResetPreparedObjects();
+            return false;
+        }
+
+        stop_.store(false, std::memory_order_release);
+        teardown_requested_.store(false, std::memory_order_release);
+        WithdrawPublishedFrame();
+        aurora_set_stereo_frame_provider(&OpenXRVulkanIntegration::ProvideStereoFrame, this);
+        provider_registered_ = true;
+        running_.store(true, std::memory_order_release);
+        try {
+            pacing_thread_ = std::thread([this] { PacingThread(); });
+        } catch (const std::exception& exception) {
+            running_.store(false, std::memory_order_release);
+            aurora_set_stereo_frame_provider(nullptr, nullptr);
+            provider_registered_ = false;
+            (void)aurora_vulkan_disable_stereo_bridge();
+            SetError(std::string("could not start the OpenXR pacing thread: ") + exception.what());
+            ResetPreparedObjects();
+            return false;
+        }
+        RT_LOG(RT_TAG_RUNTIME) << "OpenXR asynchronous Vulkan presentation started" << std::endl;
+        return true;
+    }
+
+    void Shutdown() noexcept {
+        teardown_requested_.store(false, std::memory_order_release);
+        if (pacing_thread_.joinable()) {
+            // Registration changes are only safe while no sealed frame is in
+            // flight. The caller invokes us before Aurora teardown.
+            aurora_quiesce_frame_worker();
+            aurora_set_stereo_frame_provider(nullptr, nullptr);
+            provider_registered_ = false;
+            WithdrawPublishedFrame();
+            {
+                // Pair the predicate update with the wait mutex. Otherwise a
+                // terminal pacing thread can observe false, miss the notify,
+                // and make join wait forever.
+                std::lock_guard lock(stop_mutex_);
+                stop_.store(true, std::memory_order_release);
+            }
+            stop_cv_.notify_all();
+            pacing_thread_.join();
+        } else {
+            if (provider_registered_) {
+                aurora_quiesce_frame_worker();
+                aurora_set_stereo_frame_provider(nullptr, nullptr);
+                provider_registered_ = false;
+            }
+            ShutdownOrRetainGraphicsObjects();
+        }
+        if (bridge_enabled_) {
+            aurora_quiesce_frame_worker();
+            if (!aurora_vulkan_disable_stereo_bridge() && graphics_retained_ == false) {
+                RT_LOG(RT_TAG_RUNTIME)
+                    << "OpenXR Vulkan bridge drain could not be fenced; retaining it "
+                       "and all graphics/session owners until process exit"
+                    << std::endl;
+                (void)backend_.release();
+                (void)runtime_.release();
+                graphics_retained_ = true;
+            }
+            bridge_enabled_ = false;
+        }
+        running_.store(false, std::memory_order_release);
+        PublishQuestInput({});
+        MkwVRPolicySetSessionActive(false);
+        backend_.reset();
+        runtime_.reset();
+        prepared_ = false;
+        driving_.Reset();
+        applied_session_run_serial_ = 0;
+        session_was_active_ = false;
+    }
+
+    bool IsRunning() const noexcept { return running_.load(std::memory_order_acquire); }
+
+    void ServiceProducerFrameBoundary() noexcept {
+        if (teardown_requested_.load(std::memory_order_acquire)) {
+            Shutdown();
+        }
+    }
+
+    std::string LastError() const {
+        std::lock_guard lock(error_mutex_);
+        return last_error_;
+    }
+
+private:
+    struct PublishedFrame {
+        AuroraStereoFrame frame{};
+    };
+
+    OpenXRVulkanNativeContext BuildBackendContext(
+        const AuroraVulkanNativeContext& native) noexcept {
+        OpenXRVulkanNativeContext context{};
+        context.version = kOpenXRVulkanNativeContextVersion;
+        context.struct_size = sizeof(OpenXRVulkanNativeContext);
+        context.flags = native.flags;
+        context.instance = native.instance;
+        context.physical_device = native.physicalDevice;
+        context.device = native.device;
+        context.queue = native.queue;
+        context.queue_family_index = native.queueFamilyIndex;
+        context.queue_index = native.queueIndex;
+        context.api_version = native.apiVersion;
+        context.lock_queue = [](void* userdata) -> bool {
+            const auto* self = static_cast<OpenXRVulkanIntegration*>(userdata);
+            return self != nullptr && self->native_context_.acquireQueueLock(
+                                          self->native_context_.queueLockUserdata);
+        };
+        context.unlock_queue = [](void* userdata) {
+            const auto* self = static_cast<OpenXRVulkanIntegration*>(userdata);
+            if (self != nullptr) {
+                self->native_context_.releaseQueueLock(self->native_context_.queueLockUserdata);
+            }
+        };
+        context.queue_userdata = this;
+        return context;
+    }
+
+    void ResetPreparedObjects() {
+        ShutdownOrRetainGraphicsObjects();
+        backend_.reset();
+        runtime_.reset();
+        prepared_ = false;
+    }
+
+    bool ShutdownOrRetainGraphicsObjects() noexcept {
+        // The Vulkan backend has no persistent in-flight work of its own; the
+        // sink bridge owns the pending same-queue copies and is drained by
+        // Shutdown()'s disable_stereo_bridge fence before the backend is reset.
+        bool ok = true;
+        if (backend_ != nullptr) {
+            backend_->Shutdown();
+        }
+        if (runtime_ != nullptr) {
+            runtime_->Shutdown();
+        }
+        return ok;
+    }
+
+    static bool ProvideStereoFrame(uint32_t, AuroraStereoFrame* output, void* userdata) {
+        auto* self = static_cast<OpenXRVulkanIntegration*>(userdata);
+        if (self == nullptr || output == nullptr) {
+            return false;
+        }
+        std::lock_guard lock(self->published_mutex_);
+        PublishedFrame* frame = self->published_.exchange(nullptr, std::memory_order_acq_rel);
+        if (frame == nullptr) {
+            return false;
+        }
+        *output = frame->frame;
+        return true;
+    }
+
+    static void StereoSubmitted(uint64_t frameToken, bool success, void* userdata) noexcept {
+        auto* self = static_cast<OpenXRVulkanIntegration*>(userdata);
+        if (self == nullptr) {
+            return;
+        }
+        {
+            std::lock_guard lock(self->sink_mutex_);
+            if (frameToken > self->sink_completed_serial_) {
+                self->sink_completed_serial_ = frameToken;
+                self->sink_succeeded_ = success;
+            }
+        }
+        self->sink_cv_.notify_all();
+    }
+
+    bool SinkDoneFor(uint64_t token) noexcept {
+        std::lock_guard lock(sink_mutex_);
+        return sink_completed_serial_ >= token;
+    }
+
+    enum class StereoSinkStatus {
+        Success,
+        Failed,
+        Canceled,
+        Stalled,
+    };
+
+    // Waits for Aurora to enqueue its same-queue Vulkan copies into the
+    // acquired XR swapchain images for ``token``, then reports how it ended.
+    StereoSinkStatus WaitForStereoSink(uint64_t token) noexcept {
+        using Clock = std::chrono::steady_clock;
+        {
+            std::unique_lock lock(sink_mutex_);
+            const bool completed = sink_cv_.wait_until(
+                lock, Clock::now() + std::chrono::milliseconds(250),
+                [this, token] {
+                    return stop_.load(std::memory_order_acquire) ||
+                           sink_completed_serial_ >= token;
+                });
+            if (completed && sink_completed_serial_ >= token) {
+                return sink_succeeded_ ? StereoSinkStatus::Success : StereoSinkStatus::Failed;
+            }
+            if (stop_.load(std::memory_order_acquire)) {
+                return StereoSinkStatus::Stalled;
+            }
+        }
+        // Aurora's frame worker was slower than the 250 ms discovery window.
+        // Withdraw the targets only while they have not been encoded.
+        if (aurora_vulkan_cancel_stereo_targets(token)) {
+            return StereoSinkStatus::Canceled;
+        }
+        // The worker owns encoded work; give the enqueued copy a bounded grace
+        // window to complete instead of tearing down a valid submission.
+        {
+            std::unique_lock lock(sink_mutex_);
+            const bool completed = sink_cv_.wait_until(
+                lock, Clock::now() + std::chrono::milliseconds(250),
+                [this, token] {
+                    return stop_.load(std::memory_order_acquire) ||
+                           sink_completed_serial_ >= token;
+                });
+            if (completed && sink_completed_serial_ >= token) {
+                return sink_succeeded_ ? StereoSinkStatus::Success : StereoSinkStatus::Failed;
+            }
+        }
+        return StereoSinkStatus::Stalled;
+    }
+
+    bool ReleaseEyeImages(const std::array<OpenXRVulkanEyeImage, kOpenXREyeCount>& acquired) noexcept {
+        bool ok = true;
+        for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+            if (!backend_->ReleaseEyeImage(eye)) {
+                ok = false;
+            }
+        }
+        return ok;
+    }
+
+    void PacingThread() noexcept {
+        if (RuntimeConfigFile::Get().vrAsyncPresentation.value_or(true)) {
+            PacingThreadAsynchronous();
+        } else {
+            PacingThreadSynchronous();
+        }
+    }
+
+    void PacingThreadSynchronous() noexcept {
+        bool fatal = false;
+        bool presentation_logged = false;
+        VRPresentationMode logged_presentation = VRPresentationMode::Desktop;
+        uint32_t presentation_log_count = 0;
+        bool immersive_submission_logged = false;
+        auto perf_start = std::chrono::steady_clock::now();
+        uint32_t perf_frames = 0;
+        double perf_wait_ms = 0.0;
+        double perf_submit_ms = 0.0;
+        uint32_t canceled_packets = 0;
+        uint32_t nonrender_frames = 0;
+        while (!stop_.load(std::memory_order_acquire) && !fatal) {
+            const OpenXREventStatus events = runtime_->PollEvents();
+            const bool session_active = runtime_->IsSessionRunning();
+            MkwVRPolicySetSessionActive(session_active);
+            const uint64_t session_run_serial = runtime_->SessionRunSerial();
+            if (session_run_serial != applied_session_run_serial_) {
+                applied_session_run_serial_ = session_run_serial;
+                ResetTrackingOrigin();
+            }
+            if (session_active != session_was_active_) {
+                session_was_active_ = session_active;
+                if (!session_active) {
+                    ResetTrackingOrigin();
+                }
+            }
+            if (events == OpenXREventStatus::ExitRequested) {
+                SetError("OpenXR runtime requested session exit; continuing on the desktop mirror");
+                break;
+            }
+            if (events == OpenXREventStatus::Error) {
+                SetError("OpenXR event processing failed: " + runtime_->LastError().message);
+                break;
+            }
+            if (!session_active) {
+                runtime_->PollControllers(0); // Reset the press latch while unfocused/stopped.
+                WaitForStopOrDelay(std::chrono::milliseconds(5));
+                continue;
+            }
+
+            const MkwVRPolicySnapshot policy = MkwVRPolicyGetSnapshot();
+            if ((!presentation_logged || policy.presentation != logged_presentation) &&
+                presentation_log_count < 16) {
+                presentation_logged = true;
+                logged_presentation = policy.presentation;
+                ++presentation_log_count;
+                RT_LOG(RT_TAG_RUNTIME)
+                    << "[mkw-vr] presentation="
+                    << (policy.presentation == VRPresentationMode::ImmersiveRace
+                            ? "immersive-race"
+                            : policy.presentation == VRPresentationMode::VirtualScreen
+                                  ? "virtual-screen"
+                                  : "desktop")
+                    << ", scene=" << static_cast<unsigned>(policy.scene.mode)
+                    << ", screens=" << policy.scene.local_player_count
+                    << ", camera-valid=" << policy.camera.valid
+                    << ", scene-frame=" << policy.scene.guest_frame_index
+                    << ", camera-frame=" << policy.camera.guest_frame_index
+                    << ", bindings=0x" << std::hex << policy.available_bindings
+                    << std::dec << std::endl;
+            }
+            const bool immersive = policy.presentation == VRPresentationMode::ImmersiveRace;
+
+            OpenXRFrame frame{};
+            const auto wait_start = std::chrono::steady_clock::now();
+            const OpenXRFrameStatus status = runtime_->WaitFrame(frame);
+            if (status == OpenXRFrameStatus::SessionNotRunning) {
+                MkwVRPolicySetSessionActive(false);
+                continue;
+            }
+            if (status == OpenXRFrameStatus::ExitRequested) {
+                SetError("OpenXR runtime requested session exit; continuing on the desktop mirror");
+                break;
+            }
+            if (status == OpenXRFrameStatus::Error) {
+                SetError(runtime_->LastError().message);
+                fatal = true;
+                break;
+            }
+            if (!runtime_->BeginFrame(frame)) {
+                SetError(runtime_->LastError().message);
+                fatal = true;
+                break;
+            }
+            if (!runtime_->LocateViews(frame)) {
+                SetError(runtime_->LastError().message);
+                EndBegunFrame(frame);
+                fatal = true;
+                break;
+            }
+            const auto wait_end = std::chrono::steady_clock::now();
+
+            ApplyPendingReferenceSpaceChange(frame);
+            runtime_->PollControllers(frame.predicted_display_time);
+            if (runtime_->ConsumeCameraClick() && immersive) {
+                MkwVRCycleCamera();
+            }
+
+            if (!frame.should_render || !frame.views_valid) {
+                ++nonrender_frames;
+                if ((nonrender_frames & (nonrender_frames - 1)) == 0) {
+                    RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] runtime omitted image: count="
+                        << nonrender_frames
+                        << ", should-render=" << frame.should_render
+                        << ", views-valid=" << frame.views_valid << std::endl;
+                }
+                if (!backend_->SubmitProjection(frame)) {
+                    SetError(backend_->LastError().message);
+                    fatal = true;
+                }
+                continue;
+            }
+
+            std::array<OpenXRVulkanEyeImage, kOpenXREyeCount> acquired{};
+            bool acquired_all = true;
+            for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+                if (!backend_->AcquireEyeImage(eye, acquired[eye])) {
+                    acquired_all = false;
+                    SetError(backend_->LastError().message);
+                    break;
+                }
+            }
+            if (!acquired_all) {
+                EndBegunFrame(frame);
+                fatal = true;
+                break;
+            }
+
+            {
+                std::lock_guard lock(published_mutex_);
+                const OpenXRStereoEyeLayout eye_layout{
+                    .width = {acquired[0].width, acquired[1].width},
+                    .height = {acquired[0].height, acquired[1].height},
+                };
+                const OpenXRStereoPresentation presentation{
+                    .immersive = immersive,
+                    .anchored = runtime_->PanelAnchored(),
+                    .distance_meters = policy.config.hud_distance_meters,
+                    .width_meters = policy.config.hud_width_meters,
+                };
+                driving_.Build(published_frame_.frame, frame, eye_layout, presentation,
+                               RuntimeConfigFile::Get().vrAdaptiveResolution
+                                   ? adaptive_resolution_.Scale()
+                                   : 1.0f,
+                               policy.content_tag, policy.EffectiveUnitsPerMeter(), *runtime_);
+                published_.store(&published_frame_, std::memory_order_release);
+            }
+
+            std::array<AuroraVulkanStereoTarget, kOpenXREyeCount> targets{};
+            for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+                targets[eye] = {acquired[eye].image, acquired[eye].width,
+                                acquired[eye].height,
+                                static_cast<int32_t>(acquired[eye].format)};
+            }
+            if (!aurora_vulkan_set_stereo_targets(frame.serial, targets.data(), targets.size())) {
+                SetError("aurora_vulkan_set_stereo_targets rejected the acquired swapchain images");
+                EndBegunFrame(frame);
+                fatal = true;
+                break;
+            }
+
+            const StereoSinkStatus sink = WaitForStereoSink(frame.serial);
+            WithdrawPublishedFrame();
+            if (stop_.load(std::memory_order_acquire)) {
+                // Aurora has been drained by Shutdown(); the disabled bridge
+                // below releases its pending copy and the backend teardown
+                // releases or retains the session. Do not end the OpenXR frame
+                // with images whose GPU status is unknown.
+                break;
+            }
+            if (sink == StereoSinkStatus::Success) {
+                if (!ReleaseEyeImages(acquired)) {
+                    SetError(backend_->LastError().message);
+                    // Guards seeing a still-acquired eye still end the frame.
+                    fatal = true;
+                }
+                if (!backend_->SubmitProjection(frame)) {
+                    SetError(backend_->LastError().message);
+                    fatal = true;
+                }
+                if (fatal) {
+                    break;
+                }
+                if (immersive) {
+                    const auto now = std::chrono::steady_clock::now();
+                    ++perf_frames;
+                    perf_wait_ms += std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
+                    perf_submit_ms +=
+                        std::chrono::duration<double, std::milli>(now - wait_end).count();
+                    const double seconds = std::chrono::duration<double>(now - perf_start).count();
+                    if (seconds >= 5.0) {
+                        RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] timing: submitted-fps="
+                            << perf_frames / seconds
+                            << ", xr-wait-ms=" << perf_wait_ms / perf_frames
+                            << ", producer-and-submit-ms=" << perf_submit_ms / perf_frames
+                            << std::endl;
+                        perf_start = now;
+                        perf_frames = 0;
+                        perf_wait_ms = perf_submit_ms = 0.0;
+                    }
+                }
+                if (immersive && !immersive_submission_logged) {
+                    immersive_submission_logged = true;
+                    RT_LOG(RT_TAG_RUNTIME)
+                        << "[mkw-vr] first immersive packet consumed and copied into an "
+                           "OpenXR Vulkan projection layer"
+                        << std::endl;
+                }
+                continue;
+            }
+            if (sink == StereoSinkStatus::Canceled) {
+                ++canceled_packets;
+                if ((canceled_packets & (canceled_packets - 1)) == 0) {
+                    RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] producer deadline expired after 250 ms: canceled="
+                        << canceled_packets << ", token=" << frame.serial << std::endl;
+                }
+                if (!ReleaseEyeImages(acquired) || !backend_->SubmitProjection(frame)) {
+                    SetError(backend_->LastError().message);
+                    fatal = true;
+                    break;
+                }
+                continue;
+            }
+            // Failed or Stalled: the producer did not hand over valid content.
+            SetError("Aurora did not complete the OpenXR Vulkan stereo copy; "
+                     "requesting a safe desktop fallback");
+            EndBegunFrame(frame);
+            fatal = true;
+            break;
+        }
+
+        running_.store(false, std::memory_order_release);
+        PublishQuestInput({});
+        MkwVRPolicySetSessionActive(false);
+        if (!stop_.load(std::memory_order_acquire)) {
+            // A runtime/backend failure can happen while Aurora is submitting.
+            // Ask the producer to reach a safe frame boundary, drain Aurora,
+            // and unregister the provider before this XR owner destroys state.
+            teardown_requested_.store(true, std::memory_order_release);
+            std::unique_lock lock(stop_mutex_);
+            stop_cv_.wait(lock, [this] { return stop_.load(std::memory_order_acquire); });
+        }
+        ShutdownOrRetainGraphicsObjects();
+    }
+
+    void PacingThreadAsynchronous() noexcept {
+        using Clock = std::chrono::steady_clock;
+        detail::FrameDelivery delivery;
+        OpenXRFrame pending_frame{};
+        std::array<OpenXRVulkanEyeImage, kOpenXREyeCount> pending_acquired{};
+        uint64_t pending_token = 0;
+        bool pending_active = false;
+        Clock::time_point pending_start{};
+        // Most recent completed frame, reused for display until a newer job
+        // finishes. Its images are released on completion, so projecting it
+        // under later display tokens keeps presentation decoupled from render.
+        OpenXRFrame present_frame{};
+        bool present_valid = false;
+        auto stats_start = Clock::now();
+        uint32_t displays = 0, images = 0, ticks = 0, cancellations = 0;
+        uint32_t stall_rounds = 0;
+        uint32_t acquired_bitmap = 0;
+        double period_ns = 0.0;
+        bool fatal = false;
+        uint64_t observed_session = 0;
+        RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] asynchronous compositor enabled; guest VI rate unchanged" << std::endl;
+
+        const auto invalidate = [&] {
+            delivery.InvalidateCache();
+            present_valid = false;
+        };
+        const auto complete_pending = [&]() -> bool {
+            bool sink_ok = false;
+            {
+                std::lock_guard lock(sink_mutex_);
+                sink_ok = sink_succeeded_;
+            }
+            WithdrawPublishedFrame();
+            if (!sink_ok) {
+                SetError("Asynchronous OpenXR Vulkan GPU image submission failed");
+                return false;
+            }
+            if (!backend_->ReleaseEyeImage(0) || !backend_->ReleaseEyeImage(1)) {
+                SetError(backend_->LastError().message);
+                return false;
+            }
+            // Cache the completed frame for presentation under a later display
+            // token. Its images are already released, so submitting it is legal
+            // whenever a display frame ends; the compositor presents the most
+            // recently released swapchain image.
+            present_frame = pending_frame;
+            present_valid = true;
+            delivery.Complete(pending_token);
+            ++images;
+            pending_active = false;
+            return true;
+        };
+        const auto discard_pending = [&]() -> bool {
+            // The acquired images were never encoded; releasing an unwritten
+            // acquired image changes the swapchain's most recently released
+            // image, so the cached layer must no longer be presented.
+            present_valid = false;
+            delivery.Cancel();
+            if (!ReleaseEyeImages(pending_acquired)) {
+                SetError(backend_->LastError().message);
+                return false;
+            }
+            ++cancellations;
+            pending_active = false;
+            return true;
+        };
+        const auto service_pending = [&]() -> bool {
+            if (!pending_active) {
+                return true;
+            }
+            if (SinkDoneFor(pending_token)) {
+                return complete_pending();
+            }
+            // A packet can be rejected on a content transition when the seal
+            // latches a newer tag than the published packet (see
+            // request_stereo_frame). Aurora then renders the guest frame in
+            // mono and never encodes the acquired targets, so the sink would
+            // never complete and the acquire gate would stay shut forever.
+            // Cancel the doomed packet once its bounded discovery deadline
+            // expires so a later acquisition republishes under the current tag.
+            // This mirrors the D3D12 TryCancelPendingFrame recovery path.
+            if (Clock::now() - pending_start < std::chrono::milliseconds(250)) {
+                return true;
+            }
+            WithdrawPublishedFrame();
+            if (aurora_vulkan_cancel_stereo_targets(pending_token)) {
+                return discard_pending();
+            }
+            // The frame worker owns encoded work; give the enqueued copy a
+            // bounded grace window to complete instead of tearing down a valid
+            // submission.
+            const StereoSinkStatus sink = WaitForStereoSink(pending_token);
+            if (sink == StereoSinkStatus::Success) {
+                stall_rounds = 0;
+                return complete_pending();
+            }
+            if (sink == StereoSinkStatus::Canceled) {
+                stall_rounds = 0;
+                return discard_pending();
+            }
+            // Neither the bridge cancellation nor the grace window resolved the
+            // sink. A single slow worker during a content transition must not
+            // end the VR session: keep the last presentable frame composited by
+            // the runtime while the sink is re-polled on later loop passes, and
+            // only give up once the accumulated stall exceeds the cap.
+            ++stall_rounds;
+            if (stall_rounds >= kMaxAsyncStallRounds) {
+                SetError("Aurora did not complete the OpenXR Vulkan stereo copy; "
+                         "requesting a safe desktop fallback");
+                return false;
+            }
+            if ((stall_rounds & (stall_rounds - 1)) == 0) {
+                RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] async sink unresolved; round="
+                    << stall_rounds << ", token=" << pending_token << std::endl;
+            }
+            return true;
+        };
+
+        FrameStatistics displayIntervals;
+        auto previousDisplay = Clock::now();
+        while (!stop_.load(std::memory_order_acquire) && !fatal) {
+            const auto events = runtime_->PollEvents();
+            const bool active = runtime_->IsSessionRunning();
+            MkwVRPolicySetSessionActive(active);
+            if (events == OpenXREventStatus::ExitRequested || events == OpenXREventStatus::Error) {
+                SetError("OpenXR session ended; continuing on the desktop mirror");
+                break;
+            }
+            if (!service_pending()) {
+                break;
+            }
+            const auto session = runtime_->SessionRunSerial();
+            if (session != observed_session) {
+                observed_session = session;
+                applied_session_run_serial_ = session;
+                ResetTrackingOrigin();
+                invalidate();
+                if (RuntimeConfigFile::Get().vrRefreshHz > 0)
+                    runtime_->RequestDisplayRefreshRate(RuntimeConfigFile::Get().vrRefreshHz);
+            }
+            if (!active) {
+                invalidate();
+                runtime_->PollControllers(0);
+                WaitForStopOrDelay(std::chrono::milliseconds(5));
+                continue;
+            }
+
+            auto policy = MkwVRPolicyGetSnapshot();
+            const bool immersive = policy.presentation == VRPresentationMode::ImmersiveRace;
+
+            OpenXRFrame display{};
+            const OpenXRFrameStatus status = runtime_->WaitFrame(display);
+            if (status == OpenXRFrameStatus::SessionNotRunning) {
+                continue;
+            }
+            if (status == OpenXRFrameStatus::ExitRequested) {
+                SetError("OpenXR runtime requested session exit; continuing on the desktop mirror");
+                break;
+            }
+            if (status == OpenXRFrameStatus::Error) {
+                SetError(runtime_->LastError().message);
+                fatal = true;
+                break;
+            }
+            if (!runtime_->BeginFrame(display)) {
+                SetError(runtime_->LastError().message);
+                fatal = true;
+                break;
+            }
+            if (!runtime_->LocateViews(display)) {
+                SetError(runtime_->LastError().message);
+                (void)backend_->SubmitProjection(display);
+                fatal = true;
+                break;
+            }
+
+            // A job can complete while xrWaitFrame sleeps. Harvest it before
+            // presenting, without waiting for the next guest frame to exist.
+            if (!service_pending()) {
+                (void)backend_->SubmitProjection(display);
+                break;
+            }
+
+            policy = MkwVRPolicyGetSnapshot();
+            const bool current_immersive = policy.presentation == VRPresentationMode::ImmersiveRace;
+            ApplyPendingReferenceSpaceChange(display);
+            runtime_->PollControllers(display.predicted_display_time);
+            if (runtime_->ConsumeCameraClick() && current_immersive) {
+                MkwVRCycleCamera();
+            }
+            if (!display.should_render || !display.views_valid) {
+                (void)backend_->SubmitProjection(display);
+                ++ticks;
+                continue;
+            }
+
+            if (!delivery.PendingToken() && pending_active == false) {
+                std::array<OpenXRVulkanEyeImage, kOpenXREyeCount> acquired{};
+                bool acquired_all = true;
+                for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+                    if (!backend_->AcquireEyeImage(eye, acquired[eye])) {
+                        acquired_all = false;
+                        SetError(backend_->LastError().message);
+                        break;
+                    }
+                }
+                if (!acquired_all) {
+                    fatal = true;
+                    break;
+                }
+                acquired_bitmap = (acquired_bitmap << 16) |
+                                  (static_cast<uint16_t>(acquired[0].image_index) |
+                                   (static_cast<uint16_t>(acquired[1].image_index) << 8));
+                if ((images & (images - 1)) == 0) {
+                    RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] async acquire: eyes=0x"
+                        << std::hex << acquired_bitmap << std::dec
+                        << " images=" << images << std::endl;
+                }
+
+                {
+                    std::lock_guard lock(published_mutex_);
+                    const OpenXRStereoEyeLayout eye_layout{
+                        .width = {acquired[0].width, acquired[1].width},
+                        .height = {acquired[0].height, acquired[1].height},
+                    };
+                    const OpenXRStereoPresentation presentation{
+                        .immersive = current_immersive,
+                        .anchored = runtime_->PanelAnchored(),
+                        .distance_meters = policy.config.hud_distance_meters,
+                        .width_meters = policy.config.hud_width_meters,
+                    };
+                    driving_.Build(published_frame_.frame, display, eye_layout, presentation,
+                                   RuntimeConfigFile::Get().vrAdaptiveResolution
+                                       ? adaptive_resolution_.Scale()
+                                       : 1.0f,
+                                   policy.content_tag, policy.EffectiveUnitsPerMeter(),
+                                   *runtime_);
+                    published_.store(&published_frame_, std::memory_order_release);
+                }
+
+                std::array<AuroraVulkanStereoTarget, kOpenXREyeCount> targets{};
+                for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
+                    targets[eye] = {acquired[eye].image, acquired[eye].width,
+                                    acquired[eye].height,
+                                    static_cast<int32_t>(acquired[eye].format)};
+                }
+                if (!aurora_vulkan_set_stereo_targets(display.serial, targets.data(),
+                                                      targets.size())) {
+                    SetError("aurora_vulkan_set_stereo_targets rejected the acquired swapchain images");
+                    fatal = true;
+                    break;
+                }
+                pending_frame = display;
+                pending_acquired = acquired;
+                pending_token = display.serial;
+                pending_start = Clock::now();
+                pending_active = true;
+                delivery.Start(pending_token, policy.content_tag, session);
+            }
+
+            // Release the pending sink's images and present when the guest job
+            // completed during this display frame.
+            if (pending_active) {
+                if (!service_pending()) {
+                    (void)backend_->SubmitProjection(display);
+                    break;
+                }
+            }
+            const bool show = delivery.CanDisplay(policy.content_tag, session) &&
+                              display.should_render && display.views_valid &&
+                              present_valid;
+            if (show) {
+                // Present the most recently completed frame under the current
+                // display token. Its images were released when it finished, so
+                // the compositor displays that exact image even while the next
+                // job's images are acquired.
+                if (!backend_->SubmitProjection(display, present_frame)) {
+                    SetError(backend_->LastError().message);
+                    fatal = true;
+                }
+            } else {
+                // Nothing to present yet (or the cached frame no longer matches
+                // the current content/session); end the frame without layers.
+                OpenXRFrame empty{};  // should_render == false
+                if (!backend_->SubmitProjection(display, empty)) {
+                    SetError(backend_->LastError().message);
+                    fatal = true;
+                }
+            }
+            ++ticks;
+            const auto nowDisplay = Clock::now();
+            displayIntervals.Add(std::chrono::duration<float, std::milli>(nowDisplay - previousDisplay).count());
+            previousDisplay = nowDisplay;
+            displays += show ? 1 : 0;
+            period_ns += static_cast<double>(display.predicted_display_period);
+            const double seconds = std::chrono::duration<double>(Clock::now() - stats_start).count();
+            if (seconds >= 5.0) {
+                adaptive_resolution_.Observe(float(images / seconds),
+                    float(period_ns > 0 ? 1.0e9 * ticks / period_ns : 0),
+                    RuntimeConfigFile::Get().vrAdaptiveResolution && current_immersive);
+                {
+                    std::lock_guard lock(diagnosticsMutex);
+                    diagnostics = {
+                        float(displays / seconds), float(images / seconds),
+                        float(period_ns > 0 ? 1.0e9 * ticks / period_ns : 0),
+                        displayIntervals.Percentile(.95f),
+                        displayIntervals.Percentile(.99f),
+                        pending_active ? std::max(pending_acquired[0].width, pending_acquired[1].width)
+                                       : 0u,
+                        pending_active ? std::max(pending_acquired[0].height, pending_acquired[1].height)
+                                       : 0u,
+cancellations,
+                        adaptive_resolution_.Scale(),
+                    };
+
+                    RT_LOG(RT_TAG_RUNTIME) << "[mkw-vr] async timing: display-fps="
+                        << displays / seconds
+                        << ", new-image-fps=" << images / seconds
+                        << ", runtime-hz=" << (period_ns > 0 ? 1.0e9 * ticks / period_ns : 0.0)
+                        << ", interval-p95-ms=" << displayIntervals.Percentile(.95f)
+                        << ", interval-p99-ms=" << displayIntervals.Percentile(.99f)
+                        << ", canceled=" << cancellations
+                        << ", stalls=" << stall_rounds
+                        << ", acquired=0x" << std::hex << acquired_bitmap << std::dec
+                        << std::endl;
+                    stats_start = Clock::now();
+                    displays = images = ticks = cancellations = stall_rounds = 0;
+                    acquired_bitmap = 0;
+                }
+                period_ns = 0.0;
+            }
+        }
+
+        WithdrawPublishedFrame();
+        running_.store(false, std::memory_order_release);
+        PublishQuestInput({});
+        MkwVRPolicySetSessionActive(false);
+        if (!stop_.load(std::memory_order_acquire)) {
+            teardown_requested_.store(true, std::memory_order_release);
+            std::unique_lock lock(stop_mutex_);
+            stop_cv_.wait(lock, [this] { return stop_.load(std::memory_order_acquire); });
+        }
+        ShutdownOrRetainGraphicsObjects();
+    }
+
+    void EndBegunFrame(const OpenXRFrame& frame) noexcept {
+        // Best-effort release + end. Guards that report unresolved GPU work
+        // defer image handling to the backend's session teardown.
+        (void)backend_->ReleaseEyeImage(0);
+        (void)backend_->ReleaseEyeImage(1);
+        (void)backend_->SubmitProjection(frame);
+    }
+
+    void ApplyPendingReferenceSpaceChange(const OpenXRFrame& frame) noexcept {
+        if (runtime_->ConsumeAppSpaceChangesThrough(frame.predicted_display_time)) {
+            ResetTrackingOrigin();
+        }
+    }
+
+    void ResetTrackingOrigin() noexcept {
+        driving_.Reset();
+    }
+
+    void WaitForStopOrDelay(std::chrono::milliseconds delay) {
+        std::unique_lock lock(stop_mutex_);
+        stop_cv_.wait_for(lock, delay,
+                          [this] { return stop_.load(std::memory_order_acquire); });
+    }
+
+    void WithdrawPublishedFrame() noexcept {
+        std::lock_guard lock(published_mutex_);
+        published_.store(nullptr, std::memory_order_release);
+    }
+
+    void SetError(std::string message) {
+        {
+            std::lock_guard lock(error_mutex_);
+            last_error_ = std::move(message);
+        }
+        RT_LOG(RT_TAG_RUNTIME) << "OpenXR: " << LastError() << std::endl;
+    }
+
+    OpenXRLogCallback logger_;
+    std::unique_ptr<OpenXRRuntime> runtime_;
+    std::unique_ptr<OpenXRVulkanBackend> backend_;
+    AuroraVulkanNativeContext native_context_{};
+    std::thread pacing_thread_;
+    std::atomic_bool stop_{false};
+    std::atomic_bool running_{false};
+    std::atomic_bool teardown_requested_{false};
+    std::atomic<PublishedFrame*> published_{nullptr};
+    PublishedFrame published_frame_{};
+    DrivingFrameState driving_;
+    AdaptiveResolution adaptive_resolution_;
+    std::mutex published_mutex_;
+    std::mutex stop_mutex_;
+    std::condition_variable stop_cv_;
+    mutable std::mutex error_mutex_;
+    std::string last_error_;
+    std::mutex sink_mutex_;
+    std::condition_variable sink_cv_;
+    uint64_t sink_completed_serial_ = 0;
+    bool sink_succeeded_ = false;
+    uint64_t applied_session_run_serial_ = 0;
+    bool session_was_active_ = false;
+    bool requested_ = false;
+    bool prepared_ = false;
+    bool provider_registered_ = false;
+    bool bridge_enabled_ = false;
+    bool graphics_retained_ = false;
+};
+
+#endif // defined(MKW_ENABLE_OPENXR) && !defined(_WIN32)
+
+#endif // defined(MKW_ENABLE_OPENXR)
 
 } // namespace
 
@@ -1079,28 +2190,26 @@ OpenXRStartupResult OpenXRPrepareAurora(AuroraConfig& config) {
 #elif defined(_WIN32)
     return OpenXRIntegration::Get().Prepare(config);
 #else
-    ConfigurePolicy(RuntimeConfigFile::VrEnabled(false));
-    if (!RuntimeConfigFile::VrEnabled(false)) {
-        return OpenXRStartupResult::Disabled;
-    }
-    const OpenXRVulkanCapabilityInfo capability = OpenXRVulkanBackend::DawnInteropCapability();
-    RT_LOG(RT_TAG_RUNTIME) << "OpenXR Vulkan unavailable: " << capability.reason << std::endl;
-    return OpenXRStartupResult::Unavailable;
+    return OpenXRVulkanIntegration::Get().Prepare(config);
 #endif
 }
 
 bool OpenXRStartAfterAurora(AuroraBackend active_backend) {
-#if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
-    return OpenXRIntegration::Get().Start(active_backend);
-#else
+#if !defined(MKW_ENABLE_OPENXR)
     (void)active_backend;
     return !RuntimeConfigFile::VrEnabled(false);
+#elif defined(_WIN32)
+    return OpenXRIntegration::Get().Start(active_backend);
+#else
+    return OpenXRVulkanIntegration::Get().Start(active_backend);
 #endif
 }
 
 void OpenXRShutdownBeforeAurora() noexcept {
 #if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
     OpenXRIntegration::Get().Shutdown();
+#elif defined(MKW_ENABLE_OPENXR)
+    OpenXRVulkanIntegration::Get().Shutdown();
 #else
     MkwVRPolicySetSessionActive(false);
 #endif
@@ -1109,14 +2218,18 @@ void OpenXRShutdownBeforeAurora() noexcept {
 void OpenXRServiceProducerFrameBoundary() noexcept {
 #if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
     OpenXRIntegration::Get().ServiceProducerFrameBoundary();
+#elif defined(MKW_ENABLE_OPENXR)
+    OpenXRVulkanIntegration::Get().ServiceProducerFrameBoundary();
 #endif
 }
 
 bool OpenXRIsRunning() noexcept {
-#if defined(MKW_ENABLE_OPENXR) && defined(_WIN32)
+#if !defined(MKW_ENABLE_OPENXR)
+    return false;
+#elif defined(_WIN32)
     return OpenXRIntegration::Get().IsRunning();
 #else
-    return false;
+    return OpenXRVulkanIntegration::Get().IsRunning();
 #endif
 }
 
@@ -1126,7 +2239,7 @@ std::string OpenXRLastError() {
 #elif defined(_WIN32)
     return OpenXRIntegration::Get().LastError();
 #else
-    return OpenXRVulkanBackend::DawnInteropCapability().reason;
+    return OpenXRVulkanIntegration::Get().LastError();
 #endif
 }
 

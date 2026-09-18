@@ -1,0 +1,107 @@
+Enable the instance extensions OpenXR v1 runtimes (WiVRn/Monado) require.
+
+When an app drives Vulkan through Dawn (wgpu::CreateInstance), the runtime
+never creates its own VkInstance: it inspects the app-created one. Monado's
+v1 XR_KHR_vulkan_enable path resolves on that instance and then blindly calls,
+among others, vkGetPhysicalDeviceProperties2KHR. The Vulkan loader returns
+NULL for KHR-named entry points unless the extension string was part of the
+instance's enabledExtensionNames (core 1.1 promotion alone does not suffice).
+Monado does not null-check, so the first such call becomes a SIGSEGV inside
+libopenxr_wivrn.so.
+
+Dawn's VkInstance only requests Dawn's own known InstanceExt set (Surface
+variants, DebugUtils, ValidationFeatures) because Dawn relies on core 1.1
+functions internally. This patch adds the four OpenXR-required instance
+extensions so they are requested whenever advertised, and additionally adds
+VK_KHR_external_fence_fd to the known device extensions so the external
+memory/fence/semaphore function pointers Monado resolves on Dawn's VkDevice
+(vkGetMemoryFdKHR, vkGetFenceFdKHR, ...) are non-NULL.
+
+Instance extensions required by the runtime (comp_vk_glue.c):
+  VK_KHR_get_physical_device_properties2
+  VK_KHR_external_fence_capabilities
+  VK_KHR_external_memory_capabilities
+  VK_KHR_external_semaphore_capabilities
+
+Device extension additionally required for Monado's FD sync object use:
+  VK_KHR_external_fence_fd
+
+Applied to the vendored Dawn tree by aurora-main/cmake/AuroraDawnProvider.cmake
+after dawn-vulkan-native-handles.patch when AURORA_DAWN_PROVIDER=vendor, the
+only configuration the standalone Quest target uses.
+
+diff --git a/src/dawn/native/vulkan/VulkanExtensions.cpp b/src/dawn/native/vulkan/VulkanExtensions.cpp
+index 5487266..3cf4142 100644
+--- a/src/dawn/native/vulkan/VulkanExtensions.cpp
++++ b/src/dawn/native/vulkan/VulkanExtensions.cpp
+@@ -52,6 +52,12 @@ static constexpr std::array<InstanceExtInfo, kInstanceExtCount> sInstanceExtInfo
+ 
+     {InstanceExt::DebugUtils, "VK_EXT_debug_utils"},
+     {InstanceExt::ValidationFeatures, "VK_EXT_validation_features"},
++
++    // OpenXR required instance extensions
++    {InstanceExt::GetPhysicalDeviceProperties2, "VK_KHR_get_physical_device_properties2"},
++    {InstanceExt::ExternalFenceCapabilities, "VK_KHR_external_fence_capabilities"},
++    {InstanceExt::ExternalMemoryCapabilities, "VK_KHR_external_memory_capabilities"},
++    {InstanceExt::ExternalSemaphoreCapabilities, "VK_KHR_external_semaphore_capabilities"},
+     //
+ }};
+ 
+@@ -95,6 +101,16 @@ InstanceExtSet EnsureDependencies(const InstanceExtSet& advertisedExts) {
+                 hasDependencies = true;
+                 break;
+ 
++            case InstanceExt::GetPhysicalDeviceProperties2:
++                hasDependencies = true;
++                break;
++
++            case InstanceExt::ExternalFenceCapabilities:
++            case InstanceExt::ExternalMemoryCapabilities:
++            case InstanceExt::ExternalSemaphoreCapabilities:
++                hasDependencies = HasDep(InstanceExt::GetPhysicalDeviceProperties2);
++                break;
++
+             case InstanceExt::AndroidSurface:
+             case InstanceExt::FuchsiaImagePipeSurface:
+             case InstanceExt::MetalSurface:
+@@ -163,6 +179,7 @@ static constexpr std::array<DeviceExtInfo, kDeviceExtCount> sDeviceExtInfos{{
+     {DeviceExt::ExternalMemoryDmaBuf, "VK_EXT_external_memory_dma_buf"},
+     {DeviceExt::ExternalMemoryZirconHandle, "VK_FUCHSIA_external_memory"},
+     {DeviceExt::ExternalMemoryHost, "VK_EXT_external_memory_host"},
++    {DeviceExt::ExternalFenceFD, "VK_KHR_external_fence_fd"},
+     {DeviceExt::ExternalSemaphoreFD, "VK_KHR_external_semaphore_fd"},
+     {DeviceExt::ExternalSemaphoreZirconHandle, "VK_FUCHSIA_external_semaphore"},
+     //
+@@ -229,6 +246,7 @@ DeviceExtSet EnsureDependencies(const DeviceExtSet& advertisedExts,
+             case DeviceExt::ExternalMemoryFD:
+             case DeviceExt::ExternalMemoryZirconHandle:
+             case DeviceExt::ExternalMemoryHost:
++            case DeviceExt::ExternalFenceFD:
+             case DeviceExt::ExternalSemaphoreFD:
+             case DeviceExt::ExternalSemaphoreZirconHandle:
+             case DeviceExt::QueueFamilyForeign:
+diff --git a/src/dawn/native/vulkan/VulkanExtensions.h b/src/dawn/native/vulkan/VulkanExtensions.h
+index e0ea4da..f6b360d 100644
+--- a/src/dawn/native/vulkan/VulkanExtensions.h
++++ b/src/dawn/native/vulkan/VulkanExtensions.h
+@@ -52,6 +52,13 @@ enum class InstanceExt : uint32_t {
+     DebugUtils,
+     ValidationFeatures,
+ 
++    // OpenXR requires these on the app-created instance. The capabilities extensions depend on
++    // the get_physical_device_properties2 extension, so it must come first (dependency order).
++    GetPhysicalDeviceProperties2,
++    ExternalFenceCapabilities,
++    ExternalMemoryCapabilities,
++    ExternalSemaphoreCapabilities,
++
+     EnumCount,
+ };
+ 
+@@ -122,6 +129,7 @@ enum class DeviceExt : uint32_t {
+     ExternalMemoryDmaBuf,
+     ExternalMemoryZirconHandle,
+     ExternalMemoryHost,
++    ExternalFenceFD,
+     ExternalSemaphoreFD,
+     ExternalSemaphoreZirconHandle, 

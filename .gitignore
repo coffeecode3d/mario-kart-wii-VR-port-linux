@@ -23,6 +23,10 @@
 *.wad
 Code.pul
 
+# Vulkan stereo interop capture diagnostics
+/coupled_*.bmp
+/coupled_capture_status.txt
+
 # Build output
 /build/
 /build-*/

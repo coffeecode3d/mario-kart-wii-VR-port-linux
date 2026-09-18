@@ -196,6 +196,17 @@ else()
 
     # MinGW/WSL can choke on SDL precompiled headers; disable PCH for aurora/SDL.
     set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+    # Desktop OpenXR (Linux/Vulkan) needs the stereo bridge enabled at the
+    # bottom of aurora_core. That bridge requires native VkPhysicalDevice /
+    # VkDevice / VkQueue / queue-family handles from Dawn, which the pinned
+    # prebuilt Dawn package does not export, so force a from-source vendored
+    # Dawn build carrying the dawn-vulkan-native-handles patch. Windows uses
+    # the D3D12 interop and keeps the prebuilt package default.
+    if(MKW_ENABLE_OPENXR AND MKW_PLATFORM_LINUX)
+        set(AURORA_DAWN_PROVIDER vendor CACHE STRING "" FORCE)
+        set(AURORA_DAWN_VULKAN_NATIVE_HANDLES ON CACHE BOOL "" FORCE)
+        message(STATUS "OpenXR enabled: vendoring patched Dawn for Vulkan native handles")
+    endif()
     # Isolate aurora build products to a subdirectory under the main build dir.
     add_subdirectory(${MKW_AURORA_DIR} ${CMAKE_BINARY_DIR}/aurora-build EXCLUDE_FROM_ALL)
     set(CMAKE_DISABLE_PRECOMPILE_HEADERS OFF)
@@ -290,6 +301,9 @@ if(MKW_ENABLE_OPENXR)
             message(FATAL_ERROR "OpenXR was enabled but no loader target was provided")
         endif()
         add_compile_definitions(MKW_ENABLE_OPENXR=1)
+        if(AURORA_DAWN_VULKAN_NATIVE_HANDLES)
+            add_compile_definitions(MKW_AURORA_DAWN_VULKAN_NATIVE_HANDLES=1)
+        endif()
     endif()
 endif()
 

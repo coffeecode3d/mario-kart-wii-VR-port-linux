@@ -25,8 +25,8 @@ namespace {
 
 constexpr std::array<OpenXRViewConfiguration, kOpenXREyeCount>
     kEmptyViewConfiguration{};
-constexpr std::string_view kVulkanEnable2Extension =
-    "XR_KHR_vulkan_enable2";
+constexpr std::string_view kVulkanEnableExtension =
+    "XR_KHR_vulkan_enable";
 
 bool HasExtension(const OpenXRRuntime& runtime, std::string_view extension) {
     const auto& extensions = runtime.EnabledExtensions();
@@ -102,9 +102,9 @@ bool OpenXRVulkanBackend::Initialize(
         return Fail(XR_ERROR_CALL_ORDER_INVALID, "Initialize",
                     "OpenXRRuntime already owns a graphics session");
     }
-    if (!HasExtension(runtime, kVulkanEnable2Extension)) {
+    if (!HasExtension(runtime, kVulkanEnableExtension)) {
         return Fail(XR_ERROR_EXTENSION_NOT_PRESENT, "Initialize",
-                    "XR_KHR_vulkan_enable2 was not enabled on the instance");
+                    "XR_KHR_vulkan_enable was not enabled on the instance");
     }
 #if !MKW_OPENXR_VULKAN_HEADERS_AVAILABLE
     (void)native_context;
@@ -121,8 +121,8 @@ bool OpenXRVulkanBackend::Initialize(
         return false;
     }
 
-    const XrGraphicsBindingVulkan2KHR graphics_binding{
-        XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
+    const XrGraphicsBindingVulkanKHR graphics_binding{
+        XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR,
         nullptr,
         FromOpaqueHandle<VkInstance>(native_context.instance),
         FromOpaqueHandle<VkPhysicalDevice>(native_context.physical_device),
@@ -189,21 +189,21 @@ bool OpenXRVulkanBackend::ValidateRuntimeDevice() {
 #if !MKW_OPENXR_VULKAN_HEADERS_AVAILABLE
     return false;
 #else
-    PFN_xrGetVulkanGraphicsRequirements2KHR get_requirements = nullptr;
-    PFN_xrGetVulkanGraphicsDevice2KHR get_graphics_device = nullptr;
-    if (!m_runtime->LoadFunction("xrGetVulkanGraphicsRequirements2KHR",
+    PFN_xrGetVulkanGraphicsRequirementsKHR get_requirements = nullptr;
+    PFN_xrGetVulkanGraphicsDeviceKHR get_graphics_device = nullptr;
+    if (!m_runtime->LoadFunction("xrGetVulkanGraphicsRequirementsKHR",
                                  &get_requirements) ||
-        !m_runtime->LoadFunction("xrGetVulkanGraphicsDevice2KHR",
+        !m_runtime->LoadFunction("xrGetVulkanGraphicsDeviceKHR",
                                  &get_graphics_device)) {
         m_last_error = m_runtime->LastError();
         return false;
     }
 
-    XrGraphicsRequirementsVulkan2KHR requirements{
-        XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
+    XrGraphicsRequirementsVulkanKHR requirements{
+        XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
     if (!Check(get_requirements(m_runtime->Instance(), m_runtime->SystemId(),
                                 &requirements),
-               "xrGetVulkanGraphicsRequirements2KHR")) {
+               "xrGetVulkanGraphicsRequirementsKHR")) {
         return false;
     }
 
@@ -222,25 +222,21 @@ bool OpenXRVulkanBackend::ValidateRuntimeDevice() {
                << XR_VERSION_MAJOR(requirements.maxApiVersionSupported) << '.'
                << XR_VERSION_MINOR(requirements.maxApiVersionSupported);
         return Fail(XR_ERROR_GRAPHICS_DEVICE_INVALID,
-                    "xrGetVulkanGraphicsRequirements2KHR", detail.str());
+                    "xrGetVulkanGraphicsRequirementsKHR", detail.str());
     }
 
-    XrVulkanGraphicsDeviceGetInfoKHR device_get_info{
-        XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
-    device_get_info.systemId = m_runtime->SystemId();
-    device_get_info.vulkanInstance =
-        FromOpaqueHandle<VkInstance>(m_native_context.instance);
-
     VkPhysicalDevice runtime_physical_device = VK_NULL_HANDLE;
-    if (!Check(get_graphics_device(m_runtime->Instance(), &device_get_info,
-                                   &runtime_physical_device),
-               "xrGetVulkanGraphicsDevice2KHR")) {
+    if (!Check(get_graphics_device(
+                   m_runtime->Instance(), m_runtime->SystemId(),
+                   FromOpaqueHandle<VkInstance>(m_native_context.instance),
+                   &runtime_physical_device),
+               "xrGetVulkanGraphicsDeviceKHR")) {
         return false;
     }
     if (ToOpaqueHandle(runtime_physical_device) !=
         m_native_context.physical_device) {
         return Fail(XR_ERROR_GRAPHICS_DEVICE_INVALID,
-                    "xrGetVulkanGraphicsDevice2KHR",
+                    "xrGetVulkanGraphicsDeviceKHR",
                     "OpenXR requires a different physical device than Dawn selected");
     }
     return true;
@@ -338,9 +334,9 @@ bool OpenXRVulkanBackend::CreateEyeSwapchain(uint32_t eye) {
                     "the runtime returned an empty Vulkan swapchain");
     }
 
-    std::vector<XrSwapchainImageVulkan2KHR> images(
+    std::vector<XrSwapchainImageVulkanKHR> images(
         image_count,
-        XrSwapchainImageVulkan2KHR{XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
+        XrSwapchainImageVulkanKHR{XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
     if (!Check(xrEnumerateSwapchainImages(
                    swapchain.handle, image_count, &image_count,
                    reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())),
@@ -349,7 +345,7 @@ bool OpenXRVulkanBackend::CreateEyeSwapchain(uint32_t eye) {
     }
 
     swapchain.images.reserve(image_count);
-    for (const XrSwapchainImageVulkan2KHR& image : images) {
+    for (const XrSwapchainImageVulkanKHR& image : images) {
         swapchain.images.push_back(ToOpaqueHandle(image.image));
     }
     return true;
@@ -449,27 +445,30 @@ bool OpenXRVulkanBackend::ReleaseEyeImage(uint32_t eye) {
 }
 
 bool OpenXRVulkanBackend::SubmitProjection(const OpenXRFrame& frame) {
+    return SubmitProjection(frame, frame);
+}
+
+bool OpenXRVulkanBackend::SubmitProjection(const OpenXRFrame& display,
+                                           const OpenXRFrame& present) {
     if (!IsInitialized()) {
         return Fail(XR_ERROR_HANDLE_INVALID, "SubmitProjection",
                     "backend is not initialized");
     }
-    for (const EyeSwapchain& swapchain : m_eye_swapchains) {
-        if (swapchain.acquired) {
-            return Fail(XR_ERROR_CALL_ORDER_INVALID, "SubmitProjection",
-                        "all eye images must be released before xrEndFrame");
-        }
-    }
+    // Images acquired for an in-flight Aurora job are not referenced here; the
+    // compositor presents the most recently released image of each swapchain,
+    // so ending a display frame while the next job's images are acquired is
+    // legal and keeps the asynchronous frame protocol simple.
     const bool position_valid =
-        (frame.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-    if (!frame.should_render || !frame.views_valid || !position_valid) {
-        return m_runtime->EndFrameWithoutLayers(frame);
+        (present.view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+    if (!display.should_render || !present.views_valid || !position_valid) {
+        return m_runtime->EndFrameWithoutLayers(display);
     }
 
     std::array<XrCompositionLayerProjectionView, kOpenXREyeCount> views{};
     for (uint32_t eye = 0; eye < kOpenXREyeCount; ++eye) {
         views[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-        views[eye].pose = frame.views[eye].pose;
-        views[eye].fov = frame.views[eye].fov;
+        views[eye].pose = present.views[eye].pose;
+        views[eye].fov = present.views[eye].fov;
         views[eye].subImage.swapchain = m_eye_swapchains[eye].handle;
         views[eye].subImage.imageRect = {
             {0, 0},
@@ -490,7 +489,7 @@ bool OpenXRVulkanBackend::SubmitProjection(const OpenXRFrame& frame) {
     const XrCompositionLayerBaseHeader* layers[] = {
         reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer),
     };
-    if (!m_runtime->EndFrame(frame, layers, 1)) {
+    if (!m_runtime->EndFrame(display, layers, 1)) {
         m_last_error = m_runtime->LastError();
         return false;
     }

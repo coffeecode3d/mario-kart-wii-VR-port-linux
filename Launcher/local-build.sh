@@ -65,6 +65,7 @@ translator_dll_override=""
 translator_bin_override=""
 fuse_ld_override=""
 native_prebuilt_dir=""
+openxr=0
 
 usage() {
     cat <<'EOF'
@@ -85,6 +86,7 @@ Usage: local-build.sh --output-dir DIR [options]
   --dotnet PATH                   dotnet executable (default: on PATH)
   --translator-dll PATH           Pre-built Translator.Cli.dll (skips building the translator; still needs --dotnet to run it)
   --translator-bin PATH           Self-contained Translator.Cli executable (skips building AND needs no dotnet at all)
+  --openxr                        Build the Linux binary with OpenXR VR support (vendors patched Dawn)
   --native-prebuilt-dir DIR       Precompiled aurora/third-party package (see Prepare-NativePrebuilt.sh);
                                    skips compiling aurora-main from source entirely
 EOF
@@ -109,6 +111,7 @@ while [[ $# -gt 0 ]]; do
         --dotnet) dotnet_override=$2; shift 2 ;;
         --translator-dll) translator_dll_override=$2; shift 2 ;;
         --translator-bin) translator_bin_override=$2; shift 2 ;;
+        --openxr) openxr=1; shift ;;
         --native-prebuilt-dir) native_prebuilt_dir=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
@@ -413,6 +416,12 @@ if [[ -n "$fuse_ld_override" ]]; then
 fi
 if [[ -n "$native_prebuilt_dir" ]]; then
     configure_args+=(-DMKW_NATIVE_PREBUILT_DIR="$native_prebuilt_dir")
+fi
+if [[ "$openxr" -eq 1 ]]; then
+    # OpenXR on Linux requires the Vulkan/OpenXR stereo bridge, which vendors a
+    # patched Dawn (AURORA_DAWN_VULKAN_NATIVE_HANDLES) via the runtime's CMake;
+    # the flag only needs to reach MKW_ENABLE_OPENXR here.
+    configure_args+=(-DMKW_ENABLE_OPENXR=ON)
 fi
 
 log_step configure-native "Configuring the native toolchain"

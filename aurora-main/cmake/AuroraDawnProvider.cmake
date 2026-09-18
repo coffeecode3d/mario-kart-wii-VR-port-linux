@@ -99,11 +99,39 @@ if (_aurora_dawn_provider STREQUAL "vendor")
     endif ()
 
     include(FetchContent)
-    FetchContent_Declare(dawn
-      URL "https://github.com/google/dawn/archive/refs/tags/${AURORA_DAWN_VERSION}.tar.gz"
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-      EXCLUDE_FROM_ALL
-    )
+    if (AURORA_DAWN_VULKAN_NATIVE_HANDLES AND CMAKE_SYSTEM_NAME STREQUAL Linux)
+      # The stock Dawn package exposes only VkInstance. OpenXR's Vulkan backend
+      # additionally needs Dawn's VkPhysicalDevice / VkDevice / VkQueue and the
+      # graphics queue family, so a from-source Dawn build carrying the
+      # dawn-vulkan-native-handles patch is required. Dawn tags the source this
+      # release was built from; the golden prebuilt is
+      # encounter/dawn-build@v${AURORA_DAWN_VERSION}, a tag this build cannot
+      # reference through the upstream archive URL.
+      set(_dawn_ref "13abc3bc8ea2d3c2050f9e77a12d012108ceee24")
+      find_program(AURORA_PATCH_EXECUTABLE patch REQUIRED)
+      set(_dawn_patch_file "${CMAKE_CURRENT_LIST_DIR}/patches/dawn-vulkan-native-handles.patch")
+      set(_dawn_openxr_patch_file
+        "${CMAKE_CURRENT_LIST_DIR}/patches/dawn-vulkan-openxr-instance-extensions.patch")
+      foreach (_pf IN ITEMS "${_dawn_patch_file}" "${_dawn_openxr_patch_file}")
+        if (NOT EXISTS "${_pf}")
+          message(FATAL_ERROR "Missing Dawn patch: ${_pf}")
+        endif ()
+      endforeach ()
+      message(STATUS "aurora: Vendoring patched Dawn ${_dawn_ref} for Vulkan/OpenXR native handles")
+      FetchContent_Declare(dawn
+        URL "https://github.com/google/dawn/archive/${_dawn_ref}.tar.gz"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        PATCH_COMMAND ${AURORA_PATCH_EXECUTABLE} -p1 -i "${_dawn_patch_file}"
+          COMMAND ${AURORA_PATCH_EXECUTABLE} -p1 -i "${_dawn_openxr_patch_file}"
+        EXCLUDE_FROM_ALL
+      )
+    else ()
+      FetchContent_Declare(dawn
+        URL "https://github.com/google/dawn/archive/refs/tags/${AURORA_DAWN_VERSION}.tar.gz"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        EXCLUDE_FROM_ALL
+      )
+    endif ()
     FetchContent_MakeAvailable(dawn)
     if (NOT TARGET webgpu_dawn)
       message(FATAL_ERROR "Failed to make dawn available")

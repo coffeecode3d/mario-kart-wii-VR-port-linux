@@ -40,6 +40,16 @@ if (AURORA_ENABLE_GX)
     if (CMAKE_SYSTEM_NAME STREQUAL Windows)
         target_sources(aurora_core PRIVATE lib/webgpu/d3d12_interop.cpp)
     endif ()
+    # Linux mirrors the same fallback pattern with the Vulkan/OpenXR stereo
+    # bridge. The full implementation compiles only when the patched Dawn
+    # native Vulkan handles are available (AURORA_DAWN_VULKAN_NATIVE_HANDLES);
+    # otherwise the TU provides stubs so a desktop-only build still links.
+    if (CMAKE_SYSTEM_NAME STREQUAL Linux)
+        target_sources(aurora_core PRIVATE lib/webgpu/vulkan_interop.cpp)
+    endif ()
+    if (AURORA_DAWN_VULKAN_NATIVE_HANDLES)
+        target_compile_definitions(aurora_core PRIVATE MKW_AURORA_DAWN_VULKAN_NATIVE_HANDLES)
+    endif ()
     target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
     if (DAWN_ENABLE_VULKAN)
         target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_VULKAN)

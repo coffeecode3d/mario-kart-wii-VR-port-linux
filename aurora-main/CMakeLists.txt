@@ -38,6 +38,11 @@ set(AURORA_DAWN_PROVIDER "${_default_provider}" CACHE STRING
 set_property(CACHE AURORA_DAWN_PROVIDER PROPERTY STRINGS auto vendor system package)
 set(AURORA_DAWN_LINKAGE "${_default_linkage}" CACHE STRING "Dawn linkage type preference")
 set_property(CACHE AURORA_DAWN_LINKAGE PROPERTY STRINGS shared static)
+# Build Dawn from source with the dawn-vulkan-native-handles patch so its
+# Vulkan backend exposes VkPhysicalDevice, VkDevice, VkQueue and the graphics
+# queue family. Required for the desktop Vulkan/OpenXR stereo bridge.
+option(AURORA_DAWN_VULKAN_NATIVE_HANDLES
+  "Vendor a Dawn patched with Vulkan native-handle exports (Linux OpenXR/VR)" OFF)
 
 # SDL3
 set(AURORA_SDL3_PROVIDER "${_default_provider}" CACHE STRING

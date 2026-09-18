@@ -1856,6 +1856,33 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     const auto& eye=g_stereoEyeTargets[0].output();
     captureSource={.bindGroup=webgpu::create_copy_bind_group(eye),.texture=eye.texture,.size=eye.size,.format=eye.format};
   }
+  if(const char* eyeCapFrame = std::getenv("MKW_VR_CAPTURE_EYE")) {
+    static uint32_t monoAt = UINT32_MAX;
+    static uint32_t eyeAt = UINT32_MAX;
+    const uint32_t cur = gfx::current_frame();
+    const bool wantMono = std::getenv("MKW_VR_CAPTURE_MONO") != nullptr;
+    if (monoAt == UINT32_MAX && wantMono) {
+      // Phase 1: capture the mono presentation image first.
+      monoAt = static_cast<uint32_t>(std::atoi(eyeCapFrame)) + cur;
+      aurora_request_frame_capture(monoAt, "mono_capture.bmp");
+    } else if (monoAt != UINT32_MAX && monoAt != 0 && cur == monoAt + 1) {
+      // Phase 2: the mono capture was consumed last frame; now take the eye.
+      monoAt = 0;
+      eyeAt = cur;
+      aurora_request_frame_capture(eyeAt, "eye_capture_left.bmp");
+    } else if (monoAt == UINT32_MAX && eyeAt == UINT32_MAX && !wantMono) {
+      // Phase 1 (eye-only): capture the left eye directly.
+      eyeAt = static_cast<uint32_t>(std::atoi(eyeCapFrame)) + cur;
+      aurora_request_frame_capture(eyeAt, "eye_capture_left.bmp");
+    }
+    if (monoAt != UINT32_MAX && monoAt != 0 && cur == monoAt) {
+      captureSource={.bindGroup=finalImage->bindGroup,.texture=finalImage->texture.texture,
+        .size=finalImage->texture.size,.format=finalImage->texture.format};
+    } else if (eyeAt != UINT32_MAX && cur == eyeAt) {
+      const auto& eye=g_stereoEyeTargets[0].output();
+      captureSource={.bindGroup=webgpu::create_copy_bind_group(eye),.texture=eye.texture,.size=eye.size,.format=eye.format};
+    }
+  }
   auto pendingFrameCapture = encode_frame_capture(encoder, captureSource);
   presentationJobs.push_back({
       .image = std::move(finalImage),

@@ -1,21 +1,27 @@
 # Experimental OpenXR VR
 
 WiiCompiled includes an opt-in OpenXR renderer. The Windows implementation uses D3D12 and submits
-both eyes to the active OpenXR runtime on the same graphics device as Aurora. There is no CPU
-texture readback and no second graphics device.
+both eyes to the active OpenXR runtime on the same graphics device as Aurora. The Linux
+implementation uses Vulkan and submits through the same Aurora-owned device and queue. There is no
+CPU texture readback and no second graphics device.
 
 VR is still experimental. It falls back to the normal desktop mirror when the runtime, headset,
 GPU, or graphics binding is unavailable unless `required = true` is selected.
 
 ## Requirements
 
-- Windows 10 or 11, 64-bit.
-- An active Windows OpenXR runtime and a connected compatible headset.
-- A D3D12-capable GPU and driver accepted by both OpenXR and Dawn.
-- A build made with `MKW_ENABLE_OPENXR=ON`, which is enabled by default on Windows.
+- Windows 10 or 11, 64-bit (`MKW_ENABLE_OPENXR=ON`, the default on Windows) or a 64-bit Linux
+  build with `MKW_ENABLE_OPENXR=ON`.
+- An active OpenXR runtime and a connected compatible headset.
+- A D3D12-capable GPU and driver (Windows) or a Vulkan-capable GPU and driver accepted by both
+  OpenXR and Dawn (Linux).
+- A build made with `MKW_ENABLE_OPENXR=ON`, which is enabled by default on Windows and must be
+  requested explicitly on Linux (`Launcher/local-build.sh --openxr`).
 
-The supported OpenXR distribution target is Windows with D3D12. Linux and other platforms are not
-supported release targets.
+The supported OpenXR distribution targets are Windows/D3D12 and Linux/Vulkan. The Linux build
+vendors a patched Dawn (see `aurora-main/cmake/patches/dawn-vulkan-native-handles.patch`) so the
+OpenXR backend can borrow Aurora's Vulkan device, physical device, queue, and graphics queue
+family.
 
 ## Configuration
 
@@ -203,7 +209,8 @@ the configuration file.
 | Backend | Status |
 | --- | --- |
 | Windows D3D12 | Implemented: same-adapter, same-device asynchronous OpenXR submission. |
-| Linux / other platforms | Not supported by the current distribution. |
+| Linux Vulkan | Implemented: same-device asynchronous OpenXR submission through a patched Dawn exposing the native Vulkan handles. |
+| Other platforms | Not supported by the current distribution. |
 
 ## Known limitations
 
@@ -217,10 +224,9 @@ the configuration file.
 - Native kart wheel extraction remains geometric; unusual meshes and normal deformation require
   additional model-specific work. Preparation failure uses the procedural control.
 - The desktop window remains available as a mirror and fallback.
-
-OpenXR diagnostics are written to the normal run log under
-`%LOCALAPPDATA%\\WiiCompiled\\Logs`. Search for `OpenXR` when reporting startup or submission
-failures.
+- OpenXR diagnostics are written to the normal run log (Windows:
+  `%LOCALAPPDATA%\\WiiCompiled\\Logs`). Search for `OpenXR` when reporting startup or submission
+  failures.
 
 ## Local validation
 

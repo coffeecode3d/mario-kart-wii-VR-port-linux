@@ -37,7 +37,7 @@ struct OpenXRConfig {
     float resolution_scale = 1.0f;
 
     // The graphics backend must put its binding extension in required_extensions
-    // (for example XR_KHR_D3D12_enable or XR_KHR_vulkan_enable2). Optional
+    // (for example XR_KHR_D3D12_enable or XR_KHR_vulkan_enable). Optional
     // extensions/layers are enabled only when the active runtime advertises them.
     std::vector<std::string> required_extensions;
     std::vector<std::string> optional_extensions;
