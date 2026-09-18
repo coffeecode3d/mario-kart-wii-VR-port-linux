@@ -1,5 +1,13 @@
 # Mario Kart Wii VR Port
 
+> **This is a Linux/Vulkan fork** of [heurazy/mario-kart-wii-VR-port](https://github.com/heurazy/mario-kart-wii-VR-port).
+> It adds a full Linux Vulkan OpenXR path that renders both eyes on Aurora's own
+> Vulkan device and queue. The fixed interop bridge below is the piece that makes
+> the headset picture correct; both the Windows/D3D12 and Linux/Vulkan paths use
+> the same Aurora-owned device, with **no CPU texture readback** and no second
+> graphics device. See [Building on Linux](#building-on-linux) and
+> [the interop bridge](#linux-vulkan-interop-bridge).
+
 Mario Kart Wii VR Port is a native Windows VR port of Mario Kart Wii. It combines WiiCompiled's
 static recompilation with a native OpenXR renderer and tracked-controller input. The game runs as
 native x86-64 code; no Wii emulator, interpreter, JIT, or PowerPC CPU is used at runtime.
@@ -175,6 +183,78 @@ powershell -ExecutionPolicy Bypass -File Launcher/Build-Portable.ps1 `
 The build boundary deliberately excludes translated game code and game data from Git and releases.
 See [OPENXR.md](OPENXR.md) for the implementation details, configuration keys, controller profiles,
 and validation notes.
+
+## Building on Linux
+
+The Linux VR build vendors a patched Dawn that exposes Aurora's native Vulkan handles
+(`aurora-main/cmake/patches/dawn-vulkan-native-handles.patch` plus
+`dawn-vulkan-openxr-instance-extensions.patch`) so the OpenXR backend can borrow Aurora's Vulkan
+device, physical device, queue, and graphics queue family.
+
+```bash
+# enable the OpenXR renderer in the native configure step
+Launcher/local-build.sh --output-dir ./out --openxr
+```
+
+A physical headset run is still required on the target hardware to verify controller tracking
+recovery, camera placement, and minimap legibility.
+
+## Linux/Vulkan interop bridge
+
+Both platforms submit an acquired OpenXR swapchain image to Aurora's own graphics queue. On Linux
+this goes through `aurora-main/lib/webgpu/vulkan_interop.cpp` and the C bridge in
+`aurora-main/include/aurora/vulkan_interop.h`, so a stereo SinkFrame lands in the headset's
+swapchain with zero CPU readback:
+
+1. Aurora/OpenXR borrows the same `VkDevice` + `VkQueue` Dawn renders with.
+2. **Phase A** (Dawn): the rendered eye target is copied into a shared Vulkan intermediate
+   image whose memory is exported as an opaque FD and imported into Dawn
+   (`dawn::native::vulkan::WrapVulkanImage`).
+3. **Phase B** (native Vulkan): the same intermediate is copied into the OpenXR swapchain image
+   on the shared queue, exactly as the D3D12 path advances its chain.
+
+### The layout fix (dedicated allocation)
+
+The headset originally showed grainy, tile-periodic vertical stripes (16-texel columns) while the
+desktop mirror stayed clean. A same-frame, three-way capture isolation tool
+(`MKW_VR_CAPTURE_INTERMEDIATE=1`, see below) proved Phase A was pixel-perfect (`coupled_eye_left`
+was byte-identical to `coupled_intermediate_left`) while the native Vulkan readback of the *same*
+memory (`coupled_intermediate_native_left`) was scrambled. The corruption was therefore a
+cross-API image-layout disagreement, not broken pixels.
+
+Dawn re-creates the imported image with a **dedicated allocation**
+(`VkMemoryDedicatedAllocateInfo`, chosen via `prefersDedicatedAllocation`), which is when these
+drivers select a swizzled/tiled layout. The native intermediate was previously bound with a plain
+allocation, so the two images decoded the same memory with two different tilings. The fix was to
+match Dawn on the native side:
+
+- `VK_IMAGE_CREATE_ALIAS_BIT_KHR` on the native intermediate image, mirroring the flag Dawn forces
+  onto its re-created import, and
+- a **dedicated allocation** for the exported memory (`VkMemoryDedicatedAllocateInfo.image` on the
+  native image), so both sides land on the same driver-picked swizzle.
+
+With both sides aligned the headset picture is correct. The two Dawn patches under
+`aurora-main/cmake/patches/` are applied by the CMake build (see `AuroraDawnProvider.cmake`).
+
+### Capture diagnostics
+
+Rebuild with the diagnostic armed by setting the environment variable once, and the first submitted
+stereo frame writes three same-frame BMPs plus a status file beside the binary:
+
+```bash
+MKW_VR_CAPTURE_INTERMEDIATE=1 ./native-build/WiiCompiled
+```
+
+| File | What it shows |
+| --- | --- |
+| `coupled_eye_left.bmp` | the left eye target read back through Dawn (ground truth) |
+| `coupled_intermediate_left.bmp` | the shared intermediate read back through Dawn |
+| `coupled_intermediate_native_left.bmp` | the same shared memory read through the native Vulkan image (exactly what Phase B blits) |
+| `coupled_capture_status.txt` | Dawn map status (`wait1/status1/wait2/status2`) — both `1` means both reads succeeded |
+
+Byte-identical `coupled_eye` and `coupled_intermediate` with a scrambled `coupled_intermediate_native`
+points at an interop layout mismatch (the bug fixed above); a scrambled `coupled_eye` itself means the
+corruption originates in Aurora's eye render. The `*.bmp`/status outputs are git-ignored.
 
 ## Credits
 - **[Wiicompiled VR](https://github.com/iChris4/Wiicompiled_VR)** by Ichris4, all the openxr render system was taken from his project 
