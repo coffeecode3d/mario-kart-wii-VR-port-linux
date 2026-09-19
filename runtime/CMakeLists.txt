@@ -144,6 +144,15 @@ if(MKW_NATIVE_PREBUILT_DIR)
     # Precompiled aurora + third-party archives. The source trees are still
     # present (the runtime includes aurora headers directly), they are simply
     # not compiled here.
+    # The prebuilt package is harvested with OpenXR enabled (see
+    # Launcher/Prepare-NativePrebuilt.sh), so it carries the patched Dawn and the
+    # real aurora vulkan_interop. Mirror the from-source forcing below so this
+    # project's own OpenXR/Vulkan backend sources also take the native-handles
+    # branch: line ~304 turns it into the MKW_AURORA_DAWN_VULKAN_NATIVE_HANDLES
+    # compile definition the runtime's openxr_vulkan_backend.cpp requires.
+    if(MKW_ENABLE_OPENXR AND MKW_PLATFORM_LINUX)
+        set(AURORA_DAWN_VULKAN_NATIVE_HANDLES ON CACHE BOOL "" FORCE)
+    endif()
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/NativePrebuilt.cmake")
 else()
     if(NOT EXISTS ${MKW_AURORA_DIR}/CMakeLists.txt)

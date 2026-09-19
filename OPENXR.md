@@ -16,7 +16,9 @@ GPU, or graphics binding is unavailable unless `required = true` is selected.
 - A D3D12-capable GPU and driver (Windows) or a Vulkan-capable GPU and driver accepted by both
   OpenXR and Dawn (Linux).
 - A build made with `MKW_ENABLE_OPENXR=ON`, which is enabled by default on Windows and must be
-  requested explicitly on Linux (`Launcher/local-build.sh --openxr`).
+  requested explicitly on Linux (`Launcher/local-build.sh --openxr`). The Linux AppImage and the
+  Linux setup tool pass `--openxr` to `local-build.sh` by default (`--no-openxr` opts out), so a
+  build installed through either of them is VR-enabled without extra flags.
 
 The supported OpenXR distribution targets are Windows/D3D12 and Linux/Vulkan. The Linux build
 vendors a patched Dawn (see `aurora-main/cmake/patches/dawn-vulkan-native-handles.patch`) so the
@@ -25,7 +27,10 @@ family.
 
 ## Configuration
 
-The generic runtime defaults to OpenXR disabled; the VR installer enables it. The configuration file is next to the installed game and can contain:
+The generic runtime defaults to OpenXR disabled; the VR installer enables it. On Windows the
+installer and portable bundle set `enabled = true`; on Linux the setup tool and AppImage write the
+same `[vr] enabled = true` into `Config.toml` (only when the key is absent, so an explicit
+user choice is preserved). The configuration file is next to the installed game and can contain:
 
 ```toml
 [vr]

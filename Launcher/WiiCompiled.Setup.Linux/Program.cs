@@ -156,6 +156,7 @@ internal static class Program
             flags.GetValueOrDefault("cmake"),
             flags.GetValueOrDefault("ninja"),
             flags.GetValueOrDefault("native-prebuilt-dir"),
+            openxrEnabled(flags),
             reporter, token);
 
         reporter.Progress(InstallStages.Shortcuts, "Creating shortcuts", 98);
@@ -192,6 +193,10 @@ internal static class Program
         {
             RuntimeConfiguration.SetDvdRoot(configPath, dataDir);
         }
+        if (openxrEnabled(flags))
+        {
+            RuntimeConfiguration.EnsureVrEnabledByDefault(configPath);
+        }
         if (installsRetro)
         {
             RuntimeConfiguration.SetRetroRewindRoot(configPath, retroDir!);
@@ -199,6 +204,8 @@ internal static class Program
 
         reporter.Progress(InstallStages.Shortcuts, "Install complete", 99);
     }
+
+    private static bool openxrEnabled(Dictionary<string, string?> flags) => !flags.ContainsKey("no-openxr");
 
     private static void Uninstall()
     {
@@ -324,7 +331,7 @@ internal static class Program
                   {--download-retro-wfc-payload | --skip-retro-wfc-payload}]
                   [--force-clean-build] [--translator-bin PATH] [--disc-tool-bin PATH]
                   [--cc PATH] [--cxx PATH] [--fuse-ld NAME_OR_PATH] [--cmake PATH] [--ninja PATH]
-                  [--native-prebuilt-dir DIR] [--progress-json] [--workspace DIR]
+                  [--native-prebuilt-dir DIR] [--openxr|--no-openxr] [--progress-json] [--workspace DIR]
           uninstall
           launch-base
           launch-retro

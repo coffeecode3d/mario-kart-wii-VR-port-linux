@@ -205,7 +205,9 @@ bundled_lib_dir="$work/lib/bundled"
 mkdir -p "$bundled_lib_dir"
 
 is_host_provided_lib() {
-    case "$1" in
+    # ldd reports core libraries with a full path prefix on some distros (e.g. Arch's
+    # "/lib64/ld-linux-x86-64.so.2 => ..."), so match on the basename, not the raw soname.
+    case "$(basename "$1")" in
         linux-vdso*|ld-linux*|libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libutil.so*|\
         libgcc_s.so*|libstdc++.so*) return 0 ;;
         *) return 1 ;;

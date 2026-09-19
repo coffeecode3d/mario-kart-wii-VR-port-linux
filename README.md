@@ -76,6 +76,28 @@ The launcher is at `WheelWizard/WheelWizard.exe`; the `UserData` folder keeps co
 cache, and logs beside the portable installation. `Update-VR.cmd` updates the VR runtime while
 preserving personal and compiled game data.
 
+### Linux AppImage (portable build)
+
+Download `WiiCompiled-Setup-x86_64.AppImage`, make it executable, and run it. It is a single
+self-contained file: no git clone, `dotnet`, CMake, Ninja, or compiler is needed on the machine it
+runs on. The bundled setup translates and compiles the game locally with its own clang/cmake/ninja
+toolchain, bundled translator and `nodtool`, and a precompiled aurora + patched-Dawn package.
+
+```bash
+chmod +x WiiCompiled-Setup-x86_64.AppImage
+./WiiCompiled-Setup-x86_64.AppImage install --game game.iso
+```
+
+Because this is the VR fork, the AppImage builds the game with **OpenXR VR enabled by default**
+and sets `[vr] enabled = true` in the generated `Config.toml`; pass `--no-openxr` to the setup
+command for a desktop-only build. The runtime still shells out to the system's pkg-config, Vulkan
+headers, and an OpenXR SDK at build time (matching `Launcher/local-build.sh`'s own prerequisites);
+the OpenXR SDK is fetched automatically if no system one is installed. An AppImage's mounted
+workspace is read-only, so AppRun copies it to a writable cache under
+`${XDG_DATA_HOME:-$HOME/.local/share}/WiiCompiled/workspace` on first run and re-syncs only when
+the bundled version changes; the game's generated sources, `native-build`, and `Assets` live only
+in that cache and survive AppImage updates.
+
 No release contains a ROM or a translated game executable. Compilation is intentionally performed
 locally from the disc image you select.
 
@@ -198,6 +220,14 @@ Launcher/local-build.sh --output-dir ./out --openxr
 
 A physical headset run is still required on the target hardware to verify controller tracking
 recovery, camera placement, and minimap legibility.
+
+To package the Linux setup as the portable AppImage (builds the VR-enabled game by default, see
+above):
+
+```bash
+Launcher/build-appimage.sh
+# output: Launcher/dist/WiiCompiled-Setup-x86_64.AppImage
+```
 
 ## Linux/Vulkan interop bridge
 

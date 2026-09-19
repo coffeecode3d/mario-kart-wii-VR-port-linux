@@ -122,12 +122,19 @@ fingerprint_tree() {
 # zlib came from aurora's own FetchContent (extern/CMakeLists.txt writes a redirect config for
 # exactly this), and CMAKE_DISABLE_FIND_PACKAGE_ZLIB errors out on any REQUIRED call site outright
 # (verified directly) - it cannot be scoped to only aurora's own initial, non-required check.
-# Dawn stays a prebuilt package regardless (Linux x86_64/aarch64 always auto-resolve to "package" -
-# see AuroraDawnProvider.cmake).
+# Dawn is a prebuilt package for a desktop-only harvest (Linux x86_64/aarch64 always auto-resolve
+# to "package" - see AuroraDawnProvider.cmake). This fork's AppImage is the VR build though, so the
+# harvest enables OpenXR unconditionally: runtime/CMakeLists.txt then forces
+# AURORA_DAWN_PROVIDER=vendor + AURORA_DAWN_VULKAN_NATIVE_HANDLES=ON (patched Dawn from source) and
+# aurora-main/lib/webgpu/vulkan_interop.cpp compiles its real implementation instead of stubs. The
+# resulting package therefore carries the patched Dawn the consumer's OpenXR/Vulkan backend needs.
+# -DMKW_ENABLE_OPENXR participates in flag_fingerprint below, so an existing package harvested
+# without it is already detected as stale and re-harvested.
 fixed_configure_flags=(
     -DCMAKE_BUILD_TYPE=Release
     -DBUILD_SHARED_LIBS=OFF
     -DAURORA_SDL3_PROVIDER=vendor
+    -DMKW_ENABLE_OPENXR=ON
     -DCMAKE_DISABLE_FIND_PACKAGE_absl=ON
     -DCMAKE_DISABLE_FIND_PACKAGE_PNG=ON
     -DCMAKE_DISABLE_FIND_PACKAGE_Freetype=ON

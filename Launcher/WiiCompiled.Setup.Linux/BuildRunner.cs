@@ -13,8 +13,8 @@ internal static class BuildRunner
         string workspace, string profile, string outputDir, string? baseOutputDir,
         string? retroDir, string? retroWfcOfflineDir, bool skipRetroWfcPayload,
         bool forceCleanBuild, string? translatorBin, string? ccBin, string? cxxBin, string? fuseLd,
-        string? cmakeBin, string? ninjaBin, string? nativePrebuiltDir, IInstallReporter reporter,
-        CancellationToken cancellationToken)
+        string? cmakeBin, string? ninjaBin, string? nativePrebuiltDir, bool openxr,
+        IInstallReporter reporter, CancellationToken cancellationToken)
     {
         var script = Path.Combine(workspace, "Launcher", "local-build.sh");
         if (!File.Exists(script)) throw new FileNotFoundException("local-build.sh is missing", script);
@@ -77,6 +77,10 @@ internal static class BuildRunner
         {
             startInfo.ArgumentList.Add("--native-prebuilt-dir"); startInfo.ArgumentList.Add(nativePrebuiltDir);
         }
+        // This fork vendors the Linux OpenXR/Vulkan stereo bridge (patched Dawn + aurora interop),
+        // so the VR flag defaults on; an AppImage-built game only gets VR if it reaches
+        // local-build.sh here (it no-ops on the configure line unless MKW_ENABLE_OPENXR is set).
+        if (openxr) startInfo.ArgumentList.Add("--openxr");
 
         using var process = new Process { StartInfo = startInfo };
         var window = new BuildProgressWindow(reporter, InstallStages.Build, start: 6, end: 96);
